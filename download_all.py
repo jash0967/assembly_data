@@ -463,6 +463,21 @@ def main():
         error_details=error_details,
     )
 
+    # Phase 6: drift detection. Exit 1 on any invariant violation.
+    print()
+    from validate_collection import validate
+    val_con = duckdb.connect(config.DB_PATH, read_only=True)
+    try:
+        val_errors = validate(val_con)
+    finally:
+        val_con.close()
+    if val_errors:
+        print(f"VALIDATION FAILED ({len(val_errors)} error(s)):")
+        for e in val_errors:
+            print(f"  ✗ {e}")
+        sys.exit(1)
+    print("validation: OK")
+
 
 if __name__ == "__main__":
     main()
