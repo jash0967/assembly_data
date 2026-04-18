@@ -25,6 +25,7 @@ import config
 from config import APIS, MAX_AGE
 from collector import collect_api, _generate_tasks
 from api_client import MandatoryParamError
+from age_utils import derive_age
 from progress import (
     PerStrategyETA,
     print_job_header, print_api_start, print_api_progress,
@@ -86,7 +87,7 @@ def valid_keys_for(con, api_id: str, stale_days: int = 7,
     return valid
 
 
-def transform_rows(rows: list[dict], task_key: str) -> list[dict]:
+def transform_rows(rows: list[dict], task_key: str, age_source: str = "none") -> list[dict]:
     transformed = []
     for row in rows:
         cleaned = {"_task_key": task_key}
@@ -96,6 +97,9 @@ def transform_rows(rows: list[dict], task_key: str) -> list[dict]:
                 if v == "":
                     v = None
             cleaned[k] = v
+        # Write-time age injection. None for `join:...` (resolved post-insert)
+        # or when source value is missing — backfill / validator handles those.
+        cleaned["age"] = derive_age(age_source, task_key=task_key, row=cleaned)
         transformed.append(cleaned)
     return transformed
 
@@ -121,8 +125,8 @@ def _reconnect(db_holder):
     db_holder[0] = duckdb.connect(config.DB_PATH)
 
 
-def save_rows(db_holder, table_name, task_key, api_id, name_kr, rows):
-    rows = transform_rows(rows, task_key)
+def save_rows(db_holder, table_name, task_key, api_id, name_kr, rows, age_source: str = "none"):
+    rows = transform_rows(rows, task_key, age_source)
     if not rows:
         return
     con = db_holder[0]
@@ -170,6 +174,13 @@ def save_rows(db_holder, table_name, task_key, api_id, name_kr, rows):
         raise
 
 
+_TYPED_COLUMNS = {"age": "INTEGER"}
+
+
+def _column_type(col: str) -> str:
+    return _TYPED_COLUMNS.get(col, "VARCHAR")
+
+
 def _ensure_table(con, table_name, columns):
     exists = con.execute(
         "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
@@ -178,7 +189,7 @@ def _ensure_table(con, table_name, columns):
 
     tbl = _quote_ident(table_name)
     if not exists:
-        col_defs = ", ".join(f"{_quote_ident(c)} VARCHAR" for c in columns)
+        col_defs = ", ".join(f"{_quote_ident(c)} {_column_type(c)}" for c in columns)
         con.execute(f"CREATE TABLE {tbl} ({col_defs})")
     else:
         existing = {
@@ -189,7 +200,7 @@ def _ensure_table(con, table_name, columns):
         }
         for c in columns:
             if c not in existing:
-                con.execute(f"ALTER TABLE {tbl} ADD COLUMN {_quote_ident(c)} VARCHAR")
+                con.execute(f"ALTER TABLE {tbl} ADD COLUMN {_quote_ident(c)} {_column_type(c)}")
 
 
 def _estimate_tasks(spec, age_range, con=None) -> int:
@@ -392,7 +403,8 @@ def main():
                     eta_tracker.record(_spec.strategy, 0.1)
                 else:
                     save_rows(db_holder, _spec.table_name, task_key,
-                              _spec.api_id, _spec.name_kr, rows)
+                              _spec.api_id, _spec.name_kr, rows,
+                              age_source=_spec.age_source)
                     done += 1
                     api_rows += len(rows)
                     task_elapsed = (datetime.now() - task_t0).total_seconds()
