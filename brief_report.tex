@@ -1,0 +1,171 @@
+\documentclass[11pt, a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{kotex}
+\usepackage[margin=20mm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{array}
+\usepackage{colortbl}
+\usepackage{tcolorbox}
+
+\definecolor{gapred}{HTML}{E53935}
+\definecolor{gapblue}{HTML}{1565C0}
+\definecolor{headerblue}{HTML}{1A237E}
+\definecolor{lightgray}{HTML}{F5F5F5}
+\definecolor{boxblue}{HTML}{E3F2FD}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small\color{gray} AI 정책 공론-입법 격차 분석}
+\rhead{\small\color{gray} 2026.04}
+\cfoot{\thepage}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+\begin{document}
+
+% ── 표지 ──
+\begin{center}
+\vspace*{30mm}
+{\color{headerblue}\rule{\textwidth}{2pt}}
+\vspace{8mm}
+
+{\Huge\bfseries AI 공론과 입법의 격차}\\[4mm]
+{\Large 한국·미국·EU 비교 분석 보고서}
+
+\vspace{10mm}
+{\large 2026년 4월}
+
+\vspace{8mm}
+{\color{headerblue}\rule{\textwidth}{2pt}}
+
+\vspace{40mm}
+\begin{tcolorbox}[colback=boxblue, colframe=headerblue!50, width=0.85\textwidth]
+\textbf{핵심 발견}\\[2mm]
+\textbf{시장경쟁/독과점(Market/Antitrust)} 이슈가 한국·미국·EU \textbf{3국 모두}에서 가장 큰 입법 사각지대로 확인됨. 뉴스에서 15--29\% 비중이나 관련 법안은 0--4\%에 불과.
+\end{tcolorbox}
+\end{center}
+
+\newpage
+
+% ── 1. 분석 개요 ──
+\section*{\color{headerblue}1. 분석 개요}
+
+\begin{tcolorbox}[colback=lightgray, colframe=gray!50]
+\textbf{목적} \quad AI에 대한 공적 담론(뉴스)과 실제 입법 활동 사이의 격차를 정량 측정\\
+\textbf{방법} \quad GPT-4.1-mini 기반 10개 정책 속성 자동 분류\\
+\textbf{기간} \quad 2016.03 -- 2026.04 (뉴스) / 각국 현 회기 (법안)
+\end{tcolorbox}
+
+\vspace{4mm}
+\textbf{분석 데이터 규모}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrl}
+\toprule
+\textbf{구분} & \textbf{건수} & \textbf{출처} \\
+\midrule
+뉴스 (영국) & 8,104건 & Guardian \\
+뉴스 (미국) & 2,797건 & New York Times \\
+뉴스 (한국) & 14,328건 & 네이버 뉴스 \\
+\midrule
+법안 (미국) & 207건 & 118th + 119th Congress \\
+법안 (한국) & 121건 & 22대 국회 \\
+법안 (EU) & 884건 & AI Act 조문 + 수정안 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ── 2. 주요 발견 ──
+\section*{\color{headerblue}2. 주요 발견}
+
+\subsection*{발견 1: 시장경쟁/독과점 — 3국 공통 입법 사각지대}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{figures/fig5_cross_country.pdf}
+\caption*{[그림 1] 국가별 공론-입법 격차 비교}
+\end{figure}
+
+시장경쟁/독과점(Market/Antitrust) 관련 뉴스 보도 비중은 15--29\%에 달하나, 관련 법안은 한국 0\%, 미국 3--4\%, EU 1--2\%에 불과함. \textbf{3국 모두에서 가장 큰 격차}를 보이는 공통 입법 사각지대임.
+
+\subsection*{발견 2: 한국 — 산업정책 편중, 공익법안 과잉}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{figures/fig2_gap_korea.pdf}
+\caption*{[그림 2] 한국 공론-입법 격차}
+\end{figure}
+
+\begin{itemize}[noitemsep]
+    \item 네이버 뉴스의 \textbf{47.6\%}가 산업정책 관련 — ``육성 프레임'' 지배적
+    \item 시장경쟁/독과점 관련 법안 \textbf{0건} — 가장 심각한 공백
+    \item 공익/소비자보호 법안이 27.3\%로 뉴스(5.8\%) 대비 \textbf{과잉 집중}
+\end{itemize}
+
+\subsection*{발견 3: 미국 — 정권 교체에 따른 입법 기조 급변}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{figures/fig3_gap_us.pdf}
+\caption*{[그림 3] 미국 118th vs 119th Congress 비교}
+\end{figure}
+
+\begin{itemize}[noitemsep]
+    \item 118th(바이든): 책임/윤리AI 법안 \textbf{27.9\%} $\to$ 119th(트럼프): \textbf{3.8\%}로 급감
+    \item 119th: Safety \textbf{37.7\%}, 국가안보 \textbf{28.3\%}로 급증
+    \item Market/Antitrust 공백은 양 회기 모두 지속 (+16\%p 이상)
+\end{itemize}
+
+\subsection*{발견 4: EU — Safety 단일 목적 입법}
+
+EU AI Act 113개 조항 중 \textbf{74\%가 Safety} 관련. 수정안 771건에서도 65\%가 Safety에 집중. 노동(0\%), 저작권(0\%), 선거(0\%)는 별도 법률로 처리.
+
+% ── 3. 비교표 ──
+\section*{\color{headerblue}3. 정책 속성별 비교표}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{figures/fig1_heatmap.pdf}
+\caption*{[그림 4] 8개 데이터셋의 정책 속성별 비중(\%) 히트맵}
+\end{figure}
+
+% ── 4. 시사점 ──
+\section*{\color{headerblue}4. 시사점}
+
+\begin{tcolorbox}[colback=boxblue, colframe=headerblue!50]
+\textbf{입법자 대상}
+\begin{itemize}[noitemsep]
+    \item 시장경쟁/독과점, 노동, 저작권 영역의 입법 공백 우선 해소 필요
+    \item 산업정책 외 다양한 AI 정책 속성에 대한 균형 있는 입법 필요
+\end{itemize}
+
+\textbf{정책입안자 대상}
+\begin{itemize}[noitemsep]
+    \item 국가간 비교를 통한 AI 정책 포트폴리오 벤치마킹
+    \item 정권 교체에 영향받지 않는 초당파적 AI 거버넌스 체계 필요
+\end{itemize}
+\end{tcolorbox}
+
+% ── 5. 한계 ──
+\section*{\color{headerblue}5. 한계 및 향후 과제}
+\begin{itemize}[noitemsep]
+    \item 네이버 뉴스 수집 기간 제한 (6주) — BigKinds 활용 확장 예정
+    \item Guardian/NYT 중도좌파 편향 — 보수 매체 무료 API 부재
+    \item GPT 분류의 해석 가능성 제한 — temperature=0으로 재현성 확보
+    \item 법안 수 기반 분석의 한계 — 법안 내용의 질적 차이 미반영
+\end{itemize}
+
+\vfill
+\begin{center}
+\small\color{gray}
+본 보고서의 데이터 수집·분류·시각화 전 과정은 스크립트로 구현되어 재현 가능합니다.
+\end{center}
+
+\end{document}

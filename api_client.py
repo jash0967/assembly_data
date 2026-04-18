@@ -1,7 +1,9 @@
 import logging
+import threading
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import config
 
@@ -9,6 +11,28 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _RETRY_DELAY = 2
+
+# ── 글로벌 Session (커넥션 풀 재사용) ──────────────────────
+_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+# ── 글로벌 Rate Limiter (10 req/s) ─────────────────────────
+_rate_lock = threading.Lock()
+_last_request_time = 0.0
+_MIN_INTERVAL = 0.1  # 초 (10 req/s)
+
+
+def _rate_limit():
+    """글로벌 rate limit 적용. 스레드 안전."""
+    global _last_request_time
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _MIN_INTERVAL - (now - _last_request_time)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_time = time.monotonic()
 
 
 class AssemblyAPIError(Exception):
@@ -45,14 +69,15 @@ def fetch_page(
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            resp = requests.get(url, params=params, timeout=30)
+            _rate_limit()
+            resp = _session.get(url, params=params, timeout=30)
             resp.raise_for_status()
             return _parse(resp.json(), api_id)
         except (requests.RequestException, ValueError) as exc:
             last_exc = exc
             if attempt < _MAX_RETRIES:
                 logger.warning(f"{api_id} p={page} attempt {attempt}: {exc}")
-                time.sleep(_RETRY_DELAY)
+                time.sleep(_RETRY_DELAY * attempt)
 
     raise AssemblyAPIError("NETWORK", f"{_MAX_RETRIES}회 재시도 실패: {last_exc}")
 
@@ -62,16 +87,22 @@ def _parse(data: dict, api_id: str) -> dict:
     if "RESULT" in data:
         code = data["RESULT"].get("CODE", "UNKNOWN")
         msg = data["RESULT"].get("MESSAGE", "")
+        if code.startswith("INFO"):
+            return {"total_count": 0, "rows": []}
         if "300" in code:
             raise MandatoryParamError(code, msg)
         raise AssemblyAPIError(code, msg)
 
     envelope = data.get(api_id)
-    if not envelope or not isinstance(envelope, list):
+    if not envelope or not isinstance(envelope, list) or len(envelope) == 0:
         raise AssemblyAPIError("PARSE", f"Unexpected response for {api_id}")
 
+    head_part = envelope[0]
+    if not isinstance(head_part, dict):
+        raise AssemblyAPIError("PARSE", f"Unexpected head format for {api_id}")
+
     total_count = 0
-    for item in envelope[0].get("head", []):
+    for item in head_part.get("head", []):
         if "list_total_count" in item:
             total_count = int(item["list_total_count"])
         if "RESULT" in item:
@@ -102,12 +133,21 @@ def fetch_all_pages(
     if total == 0:
         return []
 
+    # PAGE_SIZE fallback: 요청한 크기보다 적게 왔는데 더 있으면 → 100으로 재시도
+    if page_size > 100 and len(first["rows"]) < page_size and total > len(first["rows"]):
+        logger.info(f"  {api_id}: pSize={page_size} 거부됨, 100으로 fallback")
+        return fetch_all_pages(api_id, extra_params=extra_params, page_size=100)
+
     total_pages = (total + page_size - 1) // page_size
+    if total_pages > 1:
+        logger.info(f"  {api_id}: {total:,}건 / {total_pages}페이지")
 
     for p in range(2, total_pages + 1):
         if len(all_rows) >= total:
             break
         result = fetch_page(api_id, page=p, page_size=page_size, extra_params=extra_params)
         all_rows.extend(result["rows"])
+        if p % 50 == 0 or p == total_pages:
+            logger.info(f"  {api_id}: {p}/{total_pages} 페이지 ({len(all_rows):,}건)")
 
     return all_rows

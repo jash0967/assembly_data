@@ -1,7 +1,34 @@
 .env
+.mcp.json
+graphrag_workspace/settings.yaml
+graphrag_workspace/.env
+graphrag_workspace/cache/
+graphrag_workspace/output/
+graphrag_workspace/logs/
 .venv/
 __pycache__/
 *.pyc
 data/
 .vscode/
 .idea/
+figures/
+*.png
+*.jpg
+*.pdf
+ethics/
+
+# Local Claude Code settings (user-specific paths)
+.claude/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Binary documents and generated outputs
+*.odt
+*.duckdb
+treemap*.html
+subtopics_report.html
