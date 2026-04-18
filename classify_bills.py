@@ -15,17 +15,20 @@ Usage:
     python classify_bills.py us_118 us_119
     python classify_bills.py eu_act eu_amendments
     python classify_bills.py all
+    python classify_bills.py kr_22 --force   # delete caches and re-classify everything
+    python classify_bills.py all --force
 
 Outputs:
-    data/kr_{age}_ai_filtered.json              # Stage 2 output (AI bills only)
-    data/bills_classified_kr_{19,20,21,22}.json # Final classification
-    data/bills_classified_us_{118,119}.json
-    data/bills_classified_eu_{act,amendments}.json
+    cache/kr_{age}_ai_filtered.json                       # Stage 2 intermediate cache
+    data/processed/bills_classified_kr_{19,20,21,22}.json # Final classification
+    data/processed/bills_classified_us_{118,119}.json
+    data/processed/bills_classified_eu_{act,amendments}.json
 """
 import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,9 +36,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
+import duckdb
 from openai import OpenAI
 from dotenv import load_dotenv
 
+import config
 from prompts import SYSTEM_PROMPT
 
 load_dotenv()
@@ -45,8 +50,16 @@ ROOT = os.path.dirname(__file__)
 DATA_DIR = os.path.join(ROOT, "data")
 REP_DIR = os.path.join(ROOT, "replicate_carvao", "data")
 
+# Phase 4: classification + Stage-2 filter results live in DuckDB.
+# Bump PROMPT_VERSION when AI_FILTER_PROMPT or SYSTEM_PROMPT changes.
+PROMPT_VERSION = "v2_en_20260418"
+
+# Single shared write connection + lock — DuckDB serialises writes per process.
+_db_lock = threading.Lock()
+_db_con: duckdb.DuckDBPyConnection | None = None
+
 # Stage 1 (keyword) — broad AI keyword set, 3+ mentions required
-AI_KEYWORDS = re.compile(r"인공지능|AI|A\.I")
+AI_KEYWORDS = re.compile(r"인공\s*지능|(?<![A-Za-z])AI(?![A-Za-z])|A\.I\.?")
 MIN_AI_MENTIONS = 3
 
 # Stage 2 (GPT filter) — core / adjacent / unrelated
@@ -78,36 +91,47 @@ Respond ONLY with valid JSON:
 # =============================================================================
 
 def stage1_keyword_filter_kr(age: int) -> list[dict]:
-    """Stage 1: keyword filter + dedup."""
-    txt_dir = os.path.join(DATA_DIR, f"bill_txt_{age}")
-    if not os.path.isdir(txt_dir):
-        print(f"  WARN: {txt_dir} not found", flush=True)
-        return []
+    """Stage 1: keyword filter + dedup. Reads from bill_text JOIN v_bill."""
+    con = _db_con if _db_con is not None else duckdb.connect(config.DB_PATH, read_only=True)
+    must_close = _db_con is None
+    try:
+        rows = con.execute(
+            """
+            SELECT t.bill_id,
+                   COALESCE(b.bill_name, '')           AS bill_name,
+                   COALESCE(b.lead_proposer, '')        AS lead_proposer,
+                   COALESCE(CAST(b.propose_date AS VARCHAR), '') AS propose_date,
+                   COALESCE(t.reason_and_content, '')   AS reason_and_content,
+                   COALESCE(t.full_text, '')            AS full_text
+            FROM bill_text t
+            LEFT JOIN v_bill b USING (bill_id)
+            WHERE t.age = ?
+            """,
+            [age],
+        ).fetchall()
+    finally:
+        if must_close:
+            con.close()
 
-    candidates = []
-    for fname in os.listdir(txt_dir):
-        if not fname.endswith(".json"):
+    candidates: list[dict] = []
+    for bill_id, bill_name, lead, propose_date, reason, full_text in rows:
+        text_for_kw = f"{bill_name} {reason or full_text}"
+        if len(AI_KEYWORDS.findall(text_for_kw)) < MIN_AI_MENTIONS:
             continue
-        with open(os.path.join(txt_dir, fname), encoding="utf-8") as f:
-            bill = json.load(f)
-        reason = bill.get("reason_and_content", "") or bill.get("full_text", "") or ""
-        text = bill.get("bill_name", "") + " " + reason
-        if len(AI_KEYWORDS.findall(text)) < MIN_AI_MENTIONS:
-            continue
+        body = reason or full_text
         candidates.append({
-            "id": bill.get("bill_id", fname.replace(".json", "")),
-            "title": bill.get("bill_name", ""),
-            "proposer": bill.get("proposer", ""),
-            "propose_date": bill.get("propose_date", ""),
-            "reason_snippet": reason[:500],
-            "text": f"법안명: {bill.get('bill_name', '')}\n발의자: {bill.get('proposer', '')}\n\n{reason[:2000]}",
+            "id": bill_id,
+            "title": bill_name,
+            "proposer": lead,
+            "propose_date": propose_date,
+            "reason_snippet": body[:500],
+            "text": f"법안명: {bill_name}\n발의자: {lead}\n\n{body[:2000]}",
         })
 
     # Dedup: (bill_name, lead proposer) — keep latest
-    groups = {}
+    groups: dict[tuple[str, str], dict] = {}
     for c in sorted(candidates, key=lambda x: x["propose_date"]):
-        lead = c["proposer"].split(",")[0].strip() if c["proposer"] else ""
-        key = (c["title"], lead)
+        key = (c["title"], c["proposer"])
         if key not in groups or c["propose_date"] > groups[key]["propose_date"]:
             groups[key] = c
     return list(groups.values())
@@ -145,42 +169,89 @@ def _gpt_filter_one(c: dict, max_retries=5) -> dict:
     return {**c, "classification": None, "is_ai_bill": None, "gpt_reason": "max retries"}
 
 
+_AI_FILTER_UPSERT = """
+INSERT INTO bill_ai_filter
+    (bill_id, age, classification, is_ai_bill, gpt_reason, ai_provisions)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT (bill_id) DO UPDATE SET
+    age            = EXCLUDED.age,
+    classification = EXCLUDED.classification,
+    is_ai_bill     = EXCLUDED.is_ai_bill,
+    gpt_reason     = EXCLUDED.gpt_reason,
+    ai_provisions  = EXCLUDED.ai_provisions,
+    filtered_at    = now();
+"""
+
+
+def _save_ai_filter(rec: dict, age: int) -> None:
+    if rec.get("classification") is None:
+        return  # don't persist GPT errors
+    with _db_lock:
+        _db_con.execute(_AI_FILTER_UPSERT, [
+            rec["id"], age, rec.get("classification"),
+            bool(rec.get("is_ai_bill", False)),
+            rec.get("gpt_reason"), rec.get("ai_provisions"),
+        ])
+
+
+def _load_ai_filter_cache(age: int) -> dict[str, dict]:
+    con = _db_con if _db_con is not None else duckdb.connect(config.DB_PATH, read_only=True)
+    must_close = _db_con is None
+    try:
+        rows = con.execute(
+            "SELECT bill_id, classification, is_ai_bill, gpt_reason, ai_provisions "
+            "FROM bill_ai_filter WHERE age = ?",
+            [age],
+        ).fetchall()
+    finally:
+        if must_close:
+            con.close()
+    return {
+        bid: {"id": bid, "classification": cls, "is_ai_bill": bool(is_ai),
+              "gpt_reason": reason, "ai_provisions": prov}
+        for bid, cls, is_ai, reason, prov in rows
+    }
+
+
 def stage2_gpt_filter_kr(age: int, candidates: list[dict]) -> list[dict]:
-    """Stage 2: GPT core/adjacent/unrelated; returns only core+adjacent, caches full results."""
-    cache_path = os.path.join(DATA_DIR, f"kr_{age}_ai_filtered.json")
-    # Load cache
-    cache = {}
-    if os.path.exists(cache_path):
-        with open(cache_path, encoding="utf-8") as f:
-            for r in json.load(f):
-                cache[r["id"]] = r
-    # Find what's missing
-    todo = [c for c in candidates if c["id"] not in cache or cache[c["id"]].get("classification") is None]
-    print(f"  Stage 2 GPT filter: {len(candidates)} candidates, {len(todo)} to classify", flush=True)
+    """Stage 2: GPT core/adjacent/unrelated; returns only core+adjacent.
+
+    Cache lives in DuckDB.bill_ai_filter; partial results are persisted as
+    each future completes so a Ctrl-C is safe.
+    """
+    cache = _load_ai_filter_cache(age)
+    todo = [c for c in candidates if c["id"] not in cache]
+    print(f"  Stage 2 GPT filter: {len(candidates)} candidates, {len(todo)} to classify",
+          flush=True)
 
     if todo:
         done = 0
-        results_new = {}
         with ThreadPoolExecutor(max_workers=4) as ex:
             futs = {ex.submit(_gpt_filter_one, c): c for c in todo}
             for fut in as_completed(futs):
                 r = fut.result()
                 cache[r["id"]] = r
-                results_new[r["id"]] = r
+                _save_ai_filter(r, age)
                 done += 1
                 if done % 30 == 0:
                     print(f"    {done}/{len(todo)}...", flush=True)
-                    with open(cache_path, "w", encoding="utf-8") as f:
-                        json.dump(list(cache.values()), f, ensure_ascii=False)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(list(cache.values()), f, indent=2, ensure_ascii=False)
 
-    # Summary
     dist = Counter(r.get("classification", "?") for r in cache.values())
-    print(f"  Stage 2 result: core={dist.get('core',0)}, adjacent={dist.get('adjacent',0)}, "
-          f"unrelated={dist.get('unrelated',0)}, error={sum(1 for r in cache.values() if r.get('classification') is None)}", flush=True)
+    err = sum(1 for r in cache.values() if r.get("classification") is None)
+    print(
+        f"  Stage 2 result: core={dist.get('core', 0)}, adjacent={dist.get('adjacent', 0)}, "
+        f"unrelated={dist.get('unrelated', 0)}, error={err}",
+        flush=True,
+    )
 
-    ai_only = [cache[c["id"]] for c in candidates if cache.get(c["id"], {}).get("is_ai_bill") is True]
+    ai_only = [cache[c["id"]] for c in candidates
+               if cache.get(c["id"], {}).get("is_ai_bill") is True]
+    # Re-attach the candidate's text/title for downstream classification
+    by_id = {c["id"]: c for c in candidates}
+    for r in ai_only:
+        if r["id"] in by_id:
+            r.setdefault("title", by_id[r["id"]]["title"])
+            r.setdefault("text", by_id[r["id"]]["text"])
     print(f"  AI bills (core + adjacent): {len(ai_only)}", flush=True)
     return ai_only
 
@@ -299,8 +370,46 @@ TARGETS = {
 }
 
 
-def output_path(target: str) -> str:
-    return os.path.join(DATA_DIR, f"bills_classified_{target}.json")
+_CLASSIFICATION_UPSERT = """
+INSERT INTO bill_classifications
+    (bill_id, source, prompt_version, primary_attr, secondary_attr, tertiary_attr, title)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (bill_id, source, prompt_version) DO UPDATE SET
+    primary_attr   = EXCLUDED.primary_attr,
+    secondary_attr = EXCLUDED.secondary_attr,
+    tertiary_attr  = EXCLUDED.tertiary_attr,
+    title          = EXCLUDED.title,
+    classified_at  = now();
+"""
+
+
+def _save_classification(rec: dict, source: str) -> None:
+    if rec.get("primary") == "error":
+        return  # don't persist API errors — re-runs will retry
+    with _db_lock:
+        _db_con.execute(_CLASSIFICATION_UPSERT, [
+            rec["id"], source, PROMPT_VERSION,
+            rec.get("primary"), rec.get("secondary"), rec.get("tertiary"),
+            rec.get("title"),
+        ])
+
+
+def _load_existing_classification(source: str) -> dict[str, dict]:
+    con = _db_con if _db_con is not None else duckdb.connect(config.DB_PATH, read_only=True)
+    must_close = _db_con is None
+    try:
+        rows = con.execute(
+            "SELECT bill_id, primary_attr, secondary_attr, tertiary_attr, title "
+            "FROM bill_classifications WHERE source = ? AND prompt_version = ?",
+            [source, PROMPT_VERSION],
+        ).fetchall()
+    finally:
+        if must_close:
+            con.close()
+    return {
+        bid: {"id": bid, "primary": p, "secondary": s, "tertiary": t, "title": title}
+        for bid, p, s, t, title in rows
+    }
 
 
 # =============================================================================
@@ -345,39 +454,30 @@ def run_target(target: str):
     if not items:
         return
 
-    out_path = output_path(target)
-    existing = []
-    done_ids = set()
-    if os.path.exists(out_path):
-        with open(out_path, encoding="utf-8") as f:
-            existing = json.load(f)
-        err_cnt = sum(1 for r in existing if r.get("primary") == "error")
-        existing = [r for r in existing if r.get("primary") != "error"]
-        done_ids = {r["id"] for r in existing}
-        print(f"  cached: {len(existing)} success, {err_cnt} errors dropped for retry", flush=True)
+    cache = _load_existing_classification(target)
+    current_ids = {i["id"] for i in items}
+    stale_in_db = [bid for bid in cache if bid not in current_ids]
+    print(f"  cached: {len(cache)} success in DB, {len(stale_in_db)} stale (not re-fetched)",
+          flush=True)
 
-    todo = [i for i in items if i["id"] not in done_ids]
+    todo = [i for i in items if i["id"] not in cache]
     print(f"  to classify: {len(todo)}", flush=True)
 
-    if not todo:
-        summarize(existing)
-        return
+    if todo:
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {ex.submit(classify_one, i): i for i in todo}
+            for fut in as_completed(futs):
+                rec = fut.result()
+                cache[rec["id"]] = rec
+                _save_classification(rec, target)
+                done += 1
+                if done % 50 == 0:
+                    print(f"    {done}/{len(todo)}...", flush=True)
 
-    done = 0
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(classify_one, i): i for i in todo}
-        for fut in as_completed(futs):
-            existing.append(fut.result())
-            done += 1
-            if done % 50 == 0:
-                print(f"    {done}/{len(todo)}...", flush=True)
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(existing, f, ensure_ascii=False)
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
-    print(f"  saved: {out_path} ({len(existing)} total)", flush=True)
-    summarize(existing)
+    print(f"  saved to bill_classifications (source={target}, version={PROMPT_VERSION}): "
+          f"{len(cache)} total", flush=True)
+    summarize(list(cache.values()))
 
 
 def summarize(results):
@@ -390,21 +490,98 @@ def summarize(results):
         print(f"    {attr:<55} {c:>5} ({c/total*100:.1f}%)", flush=True)
 
 
+def purge_caches(targets: list[str]) -> None:
+    """Delete Stage 2 AI filter and 10-attribute classification rows for given targets."""
+    con = duckdb.connect(config.DB_PATH)
+    try:
+        cls_total = 0
+        ai_total = 0
+        for t in targets:
+            con.execute(
+                "DELETE FROM bill_classifications WHERE source = ? AND prompt_version = ?",
+                [t, PROMPT_VERSION],
+            )
+            cls_total += con.execute("SELECT changes()").fetchone()[0] if False else 0
+            if t.startswith("kr_"):
+                age = int(t.split("_")[1])
+                con.execute("DELETE FROM bill_ai_filter WHERE age = ?", [age])
+        con.commit()
+    finally:
+        if must_close:
+            con.close()
+    print(f"--force: deleted DB rows for {len(targets)} target(s) (version={PROMPT_VERSION})",
+          flush=True)
+
+
+_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    version     VARCHAR PRIMARY KEY,
+    description TEXT,
+    released_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS bill_classifications (
+    bill_id        VARCHAR NOT NULL,
+    source         VARCHAR NOT NULL,
+    prompt_version VARCHAR NOT NULL,
+    primary_attr   VARCHAR,
+    secondary_attr VARCHAR,
+    tertiary_attr  VARCHAR,
+    title          VARCHAR,
+    classified_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (bill_id, source, prompt_version)
+);
+CREATE TABLE IF NOT EXISTS bill_ai_filter (
+    bill_id        VARCHAR PRIMARY KEY,
+    age            INTEGER NOT NULL,
+    classification VARCHAR,
+    is_ai_bill     BOOLEAN,
+    gpt_reason     TEXT,
+    ai_provisions  TEXT,
+    filtered_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def _init_db() -> None:
+    """Open the shared write connection and ensure schemas + prompt_version row."""
+    global _db_con
+    _db_con = duckdb.connect(config.DB_PATH)
+    _db_con.execute(_SCHEMA_DDL)
+    _db_con.execute(
+        "INSERT INTO prompt_versions (version, description) VALUES (?, ?) "
+        "ON CONFLICT (version) DO NOTHING",
+        [PROMPT_VERSION, "10-attribute SYSTEM_PROMPT (English labels)"],
+    )
+
+
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: python classify_bills.py {{{' | '.join(TARGETS)} | all}}+")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    force = "--force" in flags
+
+    if not args:
+        print(f"Usage: python classify_bills.py {{{' | '.join(TARGETS)} | all}}+ [--force]")
         sys.exit(1)
 
-    if "all" in sys.argv[1:]:
+    if "all" in args:
         targets = list(TARGETS.keys())
     else:
-        targets = [t for t in sys.argv[1:] if t in TARGETS]
+        targets = [t for t in args if t in TARGETS]
         if not targets:
             print(f"No valid targets. Options: {list(TARGETS.keys())} or 'all'")
             sys.exit(1)
 
-    for t in targets:
-        run_target(t)
+    _init_db()
+
+    if force:
+        purge_caches(targets)
+
+    try:
+        for t in targets:
+            run_target(t)
+    finally:
+        if _db_con is not None:
+            _db_con.close()
 
 
 if __name__ == "__main__":
