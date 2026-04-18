@@ -52,13 +52,16 @@ _RAW = [
     # ── 의원 기본 ──
     ("nwvrqwxyaytdsfvhu", "국회의원 인적사항",         {}, "none",      "current_only", "constant:22",          1),
     ("nexgtxtmaamffofof", "국회의원 의원이력",         {}, "none",      "current_only", "column:UNIT_CD",       1),
-    ("nyzrglyvagmrypezq", "국회의원 위원회 경력",      {}, "none",      "current_only", "column:PROFILE_UNIT_CD", 1),
+    ("nyzrglyvagmrypezq", "국회의원 위원회 경력",      {}, "none",      "per_age",      "column:PROFILE_UNIT_CD", 1),
     ("nzmimeepazxkubdpn", "국회의원 발의법률안",       {}, "age",       "per_age",      "param:AGE",            1),
-    ("nuvypcdgahexhvrjt", "국회의원 상임위 활동",      {"DAE_NUM": None}, "age",   "per_age",      "param:DAE_NUM",        1),
+    # NB: collector.py encodes every age-strategy task as `__AGE_n` regardless
+    # of the actual API param name (DAE_NUM/REGDAESU/etc.). age_source must
+    # match the task_key encoding, so use param:AGE here.
+    ("nuvypcdgahexhvrjt", "국회의원 상임위 활동",      {"DAE_NUM": None}, "age",   "per_age",      "param:AGE",            1),
     # ── 의원 활동 ──
     ("negnlnyvatsjwocar", "국회의원 SNS정보",          {}, "none",      "current_only", "constant:22",          1),
     ("nbqbmccpamsvwebkn", "국회의원 정책 세미나 개최", {}, "year_host", "by_date",      "date:HOST_DT",         1),
-    ("numwhtqhavaqssfle", "국회의원 연구단체 등록현황", {"REGDAESU": None}, "age",  "per_age",      "param:REGDAESU",       1),
+    ("numwhtqhavaqssfle", "국회의원 연구단체 등록현황", {"REGDAESU": None}, "age",  "per_age",      "param:AGE",            1),
     ("npbzvuwvasdqldskm", "국회의원 기자회견",         {}, "year",      "by_date",      "date:TAKING_DATE",     1),
     # ── 표결 ──
     ("nojepdqqaweusdfbi", "국회의원 본회의 표결정보", {}, "lookup_bill_age", "per_age", "param:AGE",            2),
@@ -79,12 +82,12 @@ _RAW = [
     ("nwbpacrgavhjryiph", "본회의 처리안건 법률안",   {}, "age",       "per_age",      "param:AGE",            1),
     ("nrvsawtaauyihadij", "인사청문회",                 {}, "none",      "per_age",      "column:AGE",           1),
     ("nqfvrbsdafrmuzixe", "날짜별 의정활동",           {}, "daily",     "per_age",      "param:AGE",            1),
-    ("ngytonzwavydlbbha", "전원위원회 회의록",         {}, "age_year",  "per_age",      "param:DAE_NUM",        1),
+    ("ngytonzwavydlbbha", "전원위원회 회의록",         {}, "age_year",  "per_age",      "param:AGE",            1),
     # ── 예산 ──
     ("nztwkhgzakucszgls", "사업별 예산 편성 규모",    {}, "none",      "by_date",      "date:YR",              1),
     # ── 회의록 ──
-    ("nzbyfwhwaoanttzje", "본회의 회의록",             {}, "age_year",  "per_age",      "param:DAE_NUM",        1),
-    ("ncwgseseafwbuheph", "위원회 회의록",             {}, "age_year",  "per_age",      "param:DAE_NUM",        1),
+    ("nzbyfwhwaoanttzje", "본회의 회의록",             {}, "age_year",  "per_age",      "param:AGE",            1),
+    ("ncwgseseafwbuheph", "위원회 회의록",             {}, "age_year",  "per_age",      "param:AGE",            1),
     ("VCONFSUBCCONFLIST", "소위원회 회의록",           {}, "none",      "per_age",      "column:ERACO",         1),
     ("VCONFDETAIL",       "회의록별 상세정보",         {}, "lookup_conf", "per_age",    "column:ERACO",         2),
     ("VCONFBILLCONFLIST", "의안별 회의록 목록",        {}, "lookup_bill", "per_age",    "column:ERACO",         2),
@@ -96,7 +99,7 @@ _RAW = [
     ("nmfcjtvmajsbhhckf", "국회의원 의정보고서",       {}, "none",      "by_date",      "date:PUBLISH_DT",      1),
     # ── 연구/보고서 ──
     ("nfvmtaqoaldzhobsw", "소규모 연구용역 결과보고서", {}, "age_unit", "per_age",      "column:UNIT_CD",       1),
-    ("ncrwiahparxrpodcv", "연구단체 연구활동 보고서", {"REGDAESU": None}, "age", "per_age",      "param:REGDAESU",       1),
+    ("ncrwiahparxrpodcv", "연구단체 연구활동 보고서", {"REGDAESU": None}, "age", "per_age",      "param:AGE",            1),
 ]
 
 # Allow-list for validation

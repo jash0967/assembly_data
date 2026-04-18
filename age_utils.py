@@ -17,6 +17,9 @@ from datetime import date as _date
 from config import AGE_YEAR_RANGE
 
 _ERACO_RE = re.compile(r"^제(\d+)대$")
+# Alternative ERACO formats seen in the wild:
+#   nzivskufaliivfhpb (역대 의안 통계): "N대 국회" or "N대"
+_ERACO_ALT_RE = re.compile(r"^(\d+)대(?:\s*국회)?$")
 _KOREAN_AGE_RE = re.compile(r"(\d+)대")
 
 # Special bodies that appear in BILLRCP.ERACO instead of a normal "제N대".
@@ -25,6 +28,11 @@ ERACO_SPECIAL: dict[str, int] = {
     "국가보위입법회의": -3,  # 1980-1981
     "국가재건최고회의": -2,  # 1961-1963
     "비상국무회의":      -1,  # 1972-1973
+}
+# 제헌국회 = the very first National Assembly (1948), often labeled differently.
+ERACO_NAMED_AGES: dict[str, int] = {
+    "제헌": 1,
+    "제헌국회": 1,
 }
 
 # (start_date, age) sorted ascending. Each Assembly term begins May 30 of the
@@ -44,6 +52,11 @@ def parse_eraco(value) -> int | None:
     m = _ERACO_RE.match(s)
     if m:
         return int(m.group(1))
+    m = _ERACO_ALT_RE.match(s)
+    if m:
+        return int(m.group(1))
+    if s in ERACO_NAMED_AGES:
+        return ERACO_NAMED_AGES[s]
     return ERACO_SPECIAL.get(s)
 
 
