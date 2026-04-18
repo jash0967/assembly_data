@@ -1,66 +1,96 @@
 """Shared loaders for KR/US/EU bill classification + metadata.
 
-소비자들이 `data/bills_classified_*.json`을 직접 읽는 대신 이 모듈을 거치게 해서,
-`age`/`congress`/`type` 같은 필터용 메타데이터와 원본 metadata를 한 번에 결합.
+Phase 5: classification rows live in DuckDB (bill_classifications,
+bill_ai_filter). This module is now a thin wrapper that reads from DB
+and joins on-disk source metadata where applicable.
 
-어댑터 파일(`*_policy_attr_all.json`)을 없애고 여기에 기능을 일원화.
+Public signatures (preserved across the migration):
+- load_kr_bills(ages=(19,20,21,22), enrich=True) -> list[dict]
+- load_us_bills(congresses=(118,119), enrich=True) -> list[dict]
+- load_eu_bills(include=("act","amendments"), enrich=True) -> list[dict]
+
+Returned dict shape is identical to the pre-migration version so that
+figures/regenerate_all.py and validators don't need changes.
 """
+
+from __future__ import annotations
+
 import json
 import os
+from typing import Iterable
+
+import duckdb
+
+import config
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(ROOT, "data")
 REP_DIR = os.path.join(ROOT, "replicate_carvao", "data")
 
 
-def _read_json(path):
+def _read_json(path: str):
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
+def _connect_ro() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(config.DB_PATH, read_only=True)
+
+
 # =============================================================================
 # KR
 # =============================================================================
 
-def load_kr_bills(ages=(19, 20, 21, 22), enrich=True):
-    """KR 19~22대 분류 결과 + 메타데이터 결합.
+def load_kr_bills(ages: Iterable[int] = (19, 20, 21, 22),
+                  enrich: bool = True) -> list[dict]:
+    """KR 분류 결과 + 메타데이터 결합 (v_kr_bills_analysis 경유).
 
-    Args:
-        ages: 포함할 대수 (기본 19, 20, 21, 22)
-        enrich: True면 bill_txt_{age}/*.json에서 propose_date·proposer·committee 조인
-
-    Returns: list of dicts with keys:
+    Returns list of dicts with keys:
         primary, secondary, tertiary, id, title, age,
-        (enrich=True: propose_date, proposer, committee)
+        (enrich=True) propose_date, proposer, committee
     """
+    age_list = list(ages)
+    if not age_list:
+        return []
+
+    placeholders = ", ".join("?" * len(age_list))
+    cols = ["primary_attr", "secondary_attr", "tertiary_attr",
+            "bill_id", "classified_title", "bill_name", "age"]
+    if enrich:
+        cols += ["propose_date", "lead_proposer", "committee"]
+
+    sql = f"""
+        SELECT {', '.join(cols)}
+        FROM v_kr_bills_analysis
+        WHERE primary_attr IS NOT NULL
+          AND age IN ({placeholders})
+        ORDER BY age, propose_date
+    """
+
+    con = _connect_ro()
+    try:
+        rows = con.execute(sql, age_list).fetchall()
+    finally:
+        con.close()
+
     out = []
-    for age in ages:
-        cls = _read_json(os.path.join(DATA_DIR, f"bills_classified_kr_{age}.json"))
-        if not cls:
-            continue
-        txt_dir = os.path.join(DATA_DIR, f"bill_txt_{age}") if enrich else None
-        for c in cls:
-            item = {
-                "primary": c.get("primary", ""),
-                "secondary": c.get("secondary", ""),
-                "tertiary": c.get("tertiary", ""),
-                "id": c.get("id", ""),
-                "title": c.get("title", ""),
-                "age": age,
-            }
-            if enrich and txt_dir:
-                tpath = os.path.join(txt_dir, f"{item['id']}.json")
-                if os.path.exists(tpath):
-                    with open(tpath, encoding="utf-8") as f:
-                        meta = json.load(f)
-                    item["propose_date"] = meta.get("propose_date", "")
-                    item["proposer"] = meta.get("proposer", "")
-                    item["committee"] = meta.get("committee", "")
-                    if not item["title"]:
-                        item["title"] = meta.get("bill_name", "")
-            out.append(item)
+    for row in rows:
+        record = dict(zip(cols, row))
+        item = {
+            "primary":   record.get("primary_attr") or "",
+            "secondary": record.get("secondary_attr") or "",
+            "tertiary":  record.get("tertiary_attr") or "",
+            "id":        record["bill_id"],
+            "title":     record.get("classified_title") or record.get("bill_name") or "",
+            "age":       record["age"],
+        }
+        if enrich:
+            item["propose_date"] = str(record.get("propose_date") or "")
+            item["proposer"]     = record.get("lead_proposer") or ""
+            item["committee"]    = record.get("committee") or ""
+        out.append(item)
     return out
 
 
@@ -68,52 +98,61 @@ def load_kr_bills(ages=(19, 20, 21, 22), enrich=True):
 # US
 # =============================================================================
 
-def load_us_bills(congresses=(118, 119), enrich=True):
-    """US 118+119대 분류 결과 + 메타데이터 결합.
+def load_us_bills(congresses: Iterable[int] = (118, 119),
+                  enrich: bool = True) -> list[dict]:
+    """US 분류 결과 + 메타데이터 결합. 메타는 replicate_carvao/data/ JSON 파일에서.
 
-    Args:
-        congresses: 포함할 congress (기본 118, 119)
-        enrich: True면 {,us119_}bills_processed.json에서 sponsor·date·chamber 조인
-
-    Returns: list of dicts with keys:
-        primary, secondary, tertiary, id (bill_id), title, congress,
-        (enrich=True: sponsor_name, sponsor_party, sponsor_state, introduced_date,
-                     chamber, bipartisan, cosponsor_count, stage, primary_committee)
+    Returns list of dicts (keys identical to pre-migration version).
     """
-    meta_files = {
-        118: "bills_processed.json",
-        119: "us119_bills_processed.json",
-    }
+    cg_list = list(congresses)
+    if not cg_list:
+        return []
+
+    sources = [f"us_{cg}" for cg in cg_list]
+    placeholders = ", ".join("?" * len(sources))
+
+    sql = f"""
+        SELECT bill_id, primary_attr, secondary_attr, tertiary_attr,
+               title, source
+        FROM v_bill_classifications_current
+        WHERE source IN ({placeholders})
+    """
+    con = _connect_ro()
+    try:
+        rows = con.execute(sql, sources).fetchall()
+    finally:
+        con.close()
+
+    meta_files = {118: "bills_processed.json", 119: "us119_bills_processed.json"}
+    meta_by_cg: dict[int, dict[str, dict]] = {}
+    if enrich:
+        for cg in cg_list:
+            data = _read_json(os.path.join(REP_DIR, meta_files.get(cg, "")))
+            meta_by_cg[cg] = (
+                {m.get("bill_id", ""): m for m in data} if data else {}
+            )
+
     out = []
-    for cg in congresses:
-        cls = _read_json(os.path.join(DATA_DIR, f"bills_classified_us_{cg}.json"))
-        if not cls:
-            continue
-        meta_by_id = {}
-        if enrich:
-            meta = _read_json(os.path.join(REP_DIR, meta_files.get(cg, "")))
-            if meta:
-                for m in meta:
-                    meta_by_id[m.get("bill_id", "")] = m
-        for c in cls:
-            m = meta_by_id.get(c.get("id", ""), {})
-            out.append({
-                "primary": c.get("primary", ""),
-                "secondary": c.get("secondary", ""),
-                "tertiary": c.get("tertiary", ""),
-                "id": c.get("id", ""),
-                "title": c.get("title", "") or m.get("title", ""),
-                "congress": cg,
-                "sponsor_name": m.get("sponsor_name", ""),
-                "sponsor_party": m.get("sponsor_party", ""),
-                "sponsor_state": m.get("sponsor_state", ""),
-                "introduced_date": m.get("introduced_date", ""),
-                "chamber": m.get("chamber", ""),
-                "bipartisan": m.get("bipartisan", m.get("bipartisan_category", "")),
-                "cosponsor_count": m.get("cosponsor_count", 0),
-                "stage": m.get("stage", ""),
-                "primary_committee": m.get("primary_committee", ""),
-            })
+    for bill_id, p, s, t, title, source in rows:
+        cg = int(source.split("_", 1)[1])
+        m = meta_by_cg.get(cg, {}).get(bill_id, {})
+        out.append({
+            "primary":   p or "",
+            "secondary": s or "",
+            "tertiary":  t or "",
+            "id":        bill_id,
+            "title":     title or m.get("title", ""),
+            "congress":  cg,
+            "sponsor_name":     m.get("sponsor_name", ""),
+            "sponsor_party":    m.get("sponsor_party", ""),
+            "sponsor_state":    m.get("sponsor_state", ""),
+            "introduced_date":  m.get("introduced_date", ""),
+            "chamber":          m.get("chamber", ""),
+            "bipartisan":       m.get("bipartisan", m.get("bipartisan_category", "")),
+            "cosponsor_count":  m.get("cosponsor_count", 0),
+            "stage":            m.get("stage", ""),
+            "primary_committee": m.get("primary_committee", ""),
+        })
     return out
 
 
@@ -121,59 +160,69 @@ def load_us_bills(congresses=(118, 119), enrich=True):
 # EU
 # =============================================================================
 
-def load_eu_bills(include=("act", "amendments"), enrich=True):
+def load_eu_bills(include: Iterable[str] = ("act", "amendments"),
+                  enrich: bool = True) -> list[dict]:
     """EU AI Act 조문 + 수정안 분류 결과 + 메타데이터 결합.
 
-    Args:
-        include: "act", "amendments" 중 선택
-        enrich: True면 eu_ai_act_articles.json / eu_amendments.json에서 title/target 조인
-
-    Returns: list of dicts with keys:
-        primary, secondary, tertiary, id, title, type ("article"|"amendment"),
-        (article: article_num) or (amendment: amendment_num, target)
+    Returns list of dicts (keys identical to pre-migration version).
     """
-    out = []
+    include = tuple(include)
+
+    article_meta: dict[str, dict] = {}
+    amend_meta: dict[str, dict] = {}
+    if enrich:
+        if "act" in include:
+            data = _read_json(os.path.join(DATA_DIR, "eu_ai_act_articles.json"))
+            if data:
+                article_meta = {str(a.get("article_num", "")): a for a in data}
+        if "amendments" in include:
+            data = _read_json(os.path.join(DATA_DIR, "eu_amendments.json"))
+            if data:
+                amend_meta = {str(a.get("amendment_num", "")): a for a in data}
+
+    sources = []
     if "act" in include:
-        cls = _read_json(os.path.join(DATA_DIR, "bills_classified_eu_act.json"))
-        articles_meta = {}
-        if enrich and cls:
-            meta = _read_json(os.path.join(DATA_DIR, "eu_ai_act_articles.json"))
-            if meta:
-                for a in meta:
-                    articles_meta[str(a.get("article_num", ""))] = a
-        for c in cls or []:
-            aid = str(c.get("id", ""))
-            m = articles_meta.get(aid, {})
-            out.append({
-                "primary": c.get("primary", ""),
-                "secondary": c.get("secondary", ""),
-                "tertiary": c.get("tertiary", ""),
-                "id": aid,
-                "title": c.get("title", "") or m.get("title", ""),
-                "type": "article",
-                "article_num": aid,
-            })
-
+        sources.append("eu_act")
     if "amendments" in include:
-        cls = _read_json(os.path.join(DATA_DIR, "bills_classified_eu_amendments.json"))
-        amend_meta = {}
-        if enrich and cls:
-            meta = _read_json(os.path.join(DATA_DIR, "eu_amendments.json"))
-            if meta:
-                for a in meta:
-                    amend_meta[str(a.get("amendment_num", ""))] = a
-        for c in cls or []:
-            aid = str(c.get("id", ""))
-            m = amend_meta.get(aid, {})
-            out.append({
-                "primary": c.get("primary", ""),
-                "secondary": c.get("secondary", ""),
-                "tertiary": c.get("tertiary", ""),
-                "id": aid,
-                "title": c.get("title", "") or m.get("target", ""),
-                "type": "amendment",
-                "amendment_num": aid,
-                "target": c.get("title", "") or m.get("target", ""),
-            })
+        sources.append("eu_amendments")
+    if not sources:
+        return []
 
+    placeholders = ", ".join("?" * len(sources))
+    sql = f"""
+        SELECT bill_id, primary_attr, secondary_attr, tertiary_attr, title, source
+        FROM v_bill_classifications_current
+        WHERE source IN ({placeholders})
+    """
+    con = _connect_ro()
+    try:
+        rows = con.execute(sql, sources).fetchall()
+    finally:
+        con.close()
+
+    out = []
+    for bill_id, p, s, t, title, source in rows:
+        if source == "eu_act":
+            m = article_meta.get(bill_id, {})
+            out.append({
+                "primary":   p or "",
+                "secondary": s or "",
+                "tertiary":  t or "",
+                "id":        bill_id,
+                "title":     title or m.get("title", ""),
+                "type":      "article",
+                "article_num": bill_id,
+            })
+        else:  # eu_amendments
+            m = amend_meta.get(bill_id, {})
+            out.append({
+                "primary":   p or "",
+                "secondary": s or "",
+                "tertiary":  t or "",
+                "id":        bill_id,
+                "title":     title or m.get("target", ""),
+                "type":      "amendment",
+                "amendment_num": bill_id,
+                "target":    title or m.get("target", ""),
+            })
     return out
