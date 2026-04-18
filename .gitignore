@@ -31,4 +31,7 @@ ethics/
 *.odt
 *.duckdb
 treemap*.html
-subtopics_report.htmldata/docs/
+subtopics_report.html
+
+# Downloaded raw documents (PDF/HWP/HWPX)
+data/docs/
