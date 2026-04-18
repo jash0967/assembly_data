@@ -3,6 +3,18 @@
 > 이 문서는 본 프로젝트의 모든 데이터 흐름, 필터 기준, 분류 방법, 산출물을 단일 참고자료로 기록.
 > 보고서 [report_expanded_draft.md](report_expanded_draft.md)와 함께 본 파이프라인이 정본.
 
+> **2026-04-18 변경 (DB 통합 마이그레이션)** — [PLAN_db_consolidation.md](PLAN_db_consolidation.md) Phase 0~6 실행 완료.
+> 다음 산출물이 파일시스템에서 DuckDB로 이전됨:
+>
+> - `data/bill_txt_{19..22}/*.json` (77K) → `bill_text` 테이블
+> - `data/processed/bills_classified_*.json` → `bill_classifications` 테이블 (+ `prompt_versions`)
+> - `cache/kr_*_ai_filtered.json` → `bill_ai_filter` 테이블
+> - 모든 per-age 테이블에 `age INTEGER` 컬럼 주입 (자동 + backfill)
+>
+> 원본 JSON은 `data/_archive/`에 보존. 본 문서의 파일경로 표현(예: "bill_txt_22/...")은 이제 논리적 의미만
+> 가지며 실제 위치는 DB. 자세한 출처는 [CODEBOOK.md §13](CODEBOOK.md)와
+> [`bill_loaders.py`](bill_loaders.py) 참고.
+
 ---
 
 ## 0. 프로젝트 개요
@@ -146,7 +158,7 @@ Carvão Appendix II 기준 정본:
 - 핵심 판단: *"이 법안에서 AI 관련 내용을 삭제하면 법안의 존재 이유가 사라지는가?"*
 - 최종 AI 법안 = **core + adjacent만** (unrelated 제거)
 
-**캐시**: `data/kr_{age}_ai_filtered.json` — Stage 2 결과 전체 (classification·is_ai_bill·gpt_reason·ai_provisions 포함). 재실행 시 재사용.
+**캐시**: `cache/kr_{age}_ai_filtered.json` — Stage 2 결과 전체 (classification·is_ai_bill·gpt_reason·ai_provisions 포함). 재실행 시 재사용. 전면 재판정은 `classify_bills.py ... --force` 또는 파일 수동 삭제.
 
 **왜 2단계인가**: 단순 키워드 카운트만 쓰면 "조류인플루엔자(AI) 예방법", "AI 시대에 대응하여..." 같은 주변적 언급 법안이 대거 포함되어 AI 법안 수가 부풀어짐. GPT 판별로 본질적 AI 법안만 남김.
 
@@ -186,9 +198,9 @@ Carvão Appendix II 기준 정본:
 ### 4.3 법안 분류
 - 입력: 법안명 + 제안이유 앞 2,000자 (KR) / 법안 원문 앞 3,000자 (US) / 조문 앞 2,500자 (EU)
 - 출력:
-  - `data/bills_classified_kr_{19,20,21,22}.json`
-  - `data/bills_classified_us_{118,119}.json`
-  - `data/bills_classified_eu_{act,amendments}.json`
+  - `data/processed/bills_classified_kr_{19,20,21,22}.json`
+  - `data/processed/bills_classified_us_{118,119}.json`
+  - `data/processed/bills_classified_eu_{act,amendments}.json`
 
 ---
 
@@ -221,7 +233,7 @@ Carvão Appendix II 기준 정본:
 |----------|------|
 | [export_titles.py](export_titles.py) | 뉴스 제목 리스트 속성별 (매체/desk 소분류) |
 | [export_titles_title_filter.py](export_titles_title_filter.py) | 제목 키워드 필터 적용 리스트 |
-| [export_bills_kr.py](export_bills_kr.py) | 한국 법안 속성별 리스트 + 대수별 교차표 |
+| [export_bills.py](export_bills.py) | 한·미·EU 법안 속성별 리스트 + 소그룹 교차표 (kr/us/eu/all) |
 
 ### 5.4 분석·시각화
 | 스크립트 | 역할 |
@@ -231,7 +243,7 @@ Carvão Appendix II 기준 정본:
 | [generate_figures.py](generate_figures.py) | 보고서용 그림 생성 |
 | [build_treemap_data.py](build_treemap_data.py) | 트리맵 데이터 구축 |
 | [build_treemap_kr.py](build_treemap_kr.py) | 한국 법안 트리맵 |
-| [subtopic_bertopic_v4.py](subtopic_bertopic_v4.py) | BERTopic 소주제 추출 (최신 v4) |
+| [subtopic_bertopic.py](subtopic_bertopic.py) | BERTopic 소주제 추출 (EN/KO cross-lingual 정렬) |
 
 ---
 
@@ -296,7 +308,7 @@ python classify_bills.py all                                # 법안 6소스 (KR
 
 # 6. 내보내기
 python export_titles.py all                                 # 뉴스 속성별
-python export_bills_kr.py                                   # 법안 속성별
+python export_bills.py all                                  # 법안 속성별 (KR + US + EU)
 
 # 7. 시각화
 python generate_timeline.py
@@ -305,7 +317,7 @@ python generate_figures.py
 
 ### 재실행 (캐시 활용)
 - 모든 `classify*.py`는 출력 JSON 존재 시 **error 항목만 재시도**, 성공 항목은 재사용
-- `kr_{age}_ai_filtered.json` (Stage 2 결과) 재사용 — Stage 2 GPT 필터 비용 절감
+- `cache/kr_{age}_ai_filtered.json` (Stage 2 결과) 재사용 — Stage 2 GPT 필터 비용 절감
 - `naver_bodies_cache.json` (본문 fetch 캐시) 재사용
 - 네이버 raw JSON은 `collect_naver_v3.py` 내부에서 캐시 확인 후 스킵
 
@@ -329,15 +341,15 @@ python generate_figures.py
 - [ ] `data/naver_articles_final.json` (1,307, 세부주제 통합)
 - [ ] `data/naver_articles_title_filtered.json` (449, **정본**)
 - [ ] `data/naver_bodies_cache.json` (fetch 캐시)
-- [ ] `data/kr_{19,20,21,22}_ai_filtered.json` (2단계 필터 결과)
+- [ ] `cache/kr_{19,20,21,22}_ai_filtered.json` (2단계 필터 결과, 중간 캐시)
 
 ### 10속성 분류 결과 (정본)
 - [ ] `data/news_guardian_classified.json` (2,310)
 - [ ] `data/news_nyt_classified.json` (1,326)
 - [ ] `data/news_naver_classified.json` (449)
-- [ ] `data/bills_classified_kr_{19,20,21,22}.json`
-- [ ] `data/bills_classified_us_{118,119}.json`
-- [ ] `data/bills_classified_eu_{act,amendments}.json`
+- [ ] `data/processed/bills_classified_kr_{19,20,21,22}.json`
+- [ ] `data/processed/bills_classified_us_{118,119}.json`
+- [ ] `data/processed/bills_classified_eu_{act,amendments}.json`
 
 ### 사람 열람용 마크다운
 - [ ] `data/titles_{guardian,nyt,naver}_by_category.md`

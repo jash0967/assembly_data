@@ -124,11 +124,18 @@ speech_issues: 27개 카테고리 키워드 태깅 (96,622건)
 billinfodetail: 의안 상세정보 원본 (107,300건). 대수 구분 없이 통합
 nzmimeepazxkubdpn: 발의법률안 raw 테이블 (v_bill의 소스)
 
-=== AI 정책 분석 ===
-(DuckDB에는 분류 결과 없음. 정본 분류는 data/bills_classified_kr_{age}.json이며
- bill_loaders.load_kr_bills()로 로드. bill 원문은 data/bill_txt_{age}/*.json 파일.)
+=== AI 정책 분석 (Phase 3~5에서 DB로 이관) ===
+v_kr_bills_analysis: KR 법안 분석 통합 뷰. v_bill + bill_text + 분류 + AI 필터 결합.
+                     bill_loaders.load_kr_bills()가 이걸 사용.
+v_bill_classifications_current: 최신 prompt_version의 분류만 노출.
+bill_text: 법안 원문 (77,104건, ages 19-22). reason_and_content + full_text + pdf_path.
+bill_classifications: 10-속성 분류 (KR/US/EU 통합, prompt_version 버전 관리).
+bill_ai_filter: KR Stage-2 GPT 필터 (core/adjacent/unrelated, 330건).
+prompt_versions: 프롬프트 버전 레지스트리.
 
 === 참고 ===
+- 모든 per-age 테이블에 age INTEGER 컬럼 표준화 (Phase 1~2). NULL 없음 (validate_collection이 보장).
+- billrcp.age 음수값(-1, -2, -3) = 국가보위입법회의/국가재건최고회의/비상국무회의 (정상 분석은 age >= 1).
 - v_member에는 age 컬럼 없음 (22대 의원만 있음)
 - gender 값: '남', '여'
 - reelect 값: '초선', '재선', '3선', '4선', '5선', '6선'

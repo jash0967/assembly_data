@@ -1,10 +1,16 @@
 # 국회 Open API 데이터 코드북
 
-> **수집일**: 2026-04-13  
-> **수집 스크립트**: `download_all.py`  
-> **데이터베이스**: `data/assembly.duckdb` (572 MB)  
-> **수집 범위**: 제13대 ~ 제22대 국회 (일부 테이블은 전체 대수 포함)  
-> **총 레코드**: 약 4,530,000건 (37개 API, 35개 테이블)
+> **수집일**: 2026-04-13 (Phase 1~6 통합 마이그레이션 2026-04-18)
+> **수집 스크립트**: `download_all.py`
+> **데이터베이스**: `data/assembly.duckdb` (572 MB)
+> **수집 범위**: 제13대 ~ 제22대 국회 (일부 테이블은 전체 대수 포함)
+> **총 레코드**: 약 4,890,000건 (37개 Open API + bill_text 77K + 분류 결과 1.7K)
+>
+> **2026-04-18 변경**: 모든 per-age 테이블에 `age INTEGER` 컬럼 표준화. 기존
+> AGE/DAE_NUM/ERACO/UNIT_CD 등 다양한 형식의 대수 식별자는 그대로 유지하되,
+> 신규 `age` 컬럼이 정수 캐스트 + 표준 의미를 보장. 자세한 출처는 §13의
+> [AGE 컬럼 출처표](#age-컬럼-출처표) 참고. ApiSpec 선언은
+> [config.py](config.py)의 `_RAW`에 있음.
 
 ---
 
@@ -855,3 +861,146 @@ vconfsubcconflist (소위원회 회의록)
 | `name_kr` | API 한글명 |
 | `row_count` | 수집 건수 |
 | `fetched_at` | 수집 시각 |
+
+---
+
+## 13. AI 정책 분석 통합 테이블 (Phase 3~5 도입)
+
+이 섹션의 테이블·뷰는 [PLAN_db_consolidation.md](PLAN_db_consolidation.md) 실행으로
+2026-04-18에 추가된 통합 데이터 레이어입니다. 외부 JSON 파일에서 DB로 이관 완료.
+
+### `bill_text` — 법안 원문
+[`download_bills.py`](download_bills.py) + [`migrate_bill_text.py`](migrate_bill_text.py)
+가 채움. PDF는 파일시스템 유지, 텍스트만 DB.
+
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `bill_id` | VARCHAR PK | `billrcp.BILL_ID` 와 동일 |
+| `age` | INTEGER NOT NULL | 19~22 |
+| `reason_and_content` | TEXT | 제안이유 및 주요내용 (parse_bill_sections 결과) |
+| `full_text` | TEXT | fitz 추출 전체 텍스트 |
+| `pdf_path` | VARCHAR | 원본 PDF 절대경로 |
+| `extractor_version` | VARCHAR DEFAULT 'fitz-1.0' | 텍스트 추출 도구 버전 |
+| `extracted_at` | TIMESTAMP | 추출 시각 |
+
+행수: 77,104 (age 19=15,426 / 20=21,593 / 21=23,639 / 22=16,446).
+
+### `bill_classifications` — 10-속성 분류 결과
+[`classify_bills.py`](classify_bills.py) + [`migrate_bill_classifications.py`](migrate_bill_classifications.py).
+
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `bill_id` | VARCHAR | KR=`PRC_*`, US=`H.R. n` / `S. n`, EU=조문번호/수정안번호 |
+| `source` | VARCHAR | `kr_19`/`kr_20`/`kr_21`/`kr_22`/`us_118`/`us_119`/`eu_act`/`eu_amendments` |
+| `prompt_version` | VARCHAR | `prompt_versions.version` 참조 |
+| `primary_attr` | VARCHAR | Carvão 10-속성 1차 |
+| `secondary_attr` | VARCHAR | 2차 |
+| `tertiary_attr` | VARCHAR | 3차 |
+| `title` | VARCHAR | 분류 시점의 법안명 |
+| `classified_at` | TIMESTAMP | 분류 시각 |
+
+PK = `(bill_id, source, prompt_version)`. 같은 법안의 여러 prompt 버전 공존 가능.
+
+### `bill_ai_filter` — KR Stage-2 GPT 필터
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `bill_id` | VARCHAR PK | KR `billrcp.BILL_ID` |
+| `age` | INTEGER NOT NULL | 19~22 |
+| `classification` | VARCHAR | `core` / `adjacent` / `unrelated` |
+| `is_ai_bill` | BOOLEAN | core+adjacent → true |
+| `gpt_reason` | TEXT | 1문장 한국어 이유 |
+| `ai_provisions` | TEXT | adjacent일 경우 AI 관련 조항 요약 |
+| `filtered_at` | TIMESTAMP | 분류 시각 |
+
+행수: 330 (kr_19=5 / 20=17 / 21=67 / 22=241).
+
+### `prompt_versions` — 프롬프트 버전 레지스트리
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `version` | VARCHAR PK | `v{major}_{lang}_{YYYYMMDD}` |
+| `description` | TEXT | 한 줄 설명 |
+| `released_at` | TIMESTAMP | 등록 시각 |
+
+현재 등록: `v2_en_20260418` (영문 SYSTEM_PROMPT). 프롬프트 변경 시 [`classify_bills.py`](classify_bills.py)
+의 `PROMPT_VERSION` 상수를 새 값으로 수정하면 자동 등록됨.
+
+### `v_bill_classifications_current` (뷰)
+가장 최신 `prompt_version`만 노출. 일상 쿼리는 이걸 사용.
+
+### `v_kr_bills_analysis` (뷰)
+KR 법안 분석용 통합 뷰. `v_bill` LEFT JOIN `bill_text` LEFT JOIN
+`v_bill_classifications_current` (source LIKE 'kr_%') LEFT JOIN `bill_ai_filter`.
+[`bill_loaders.load_kr_bills`](bill_loaders.py)가 이 뷰를 사용.
+
+---
+
+## AGE 컬럼 출처표
+
+[`config.py`](config.py)의 ApiSpec 선언과 동일. `age_behavior`별로 정렬.
+
+`age` 컬럼은 모든 per_age/by_date/by_bill_id 테이블에 INTEGER로 존재하며
+NULL이 없음 (Phase 6 [`validate_collection.py`](validate_collection.py)가 보장).
+`current_only` 테이블은 모두 `age = 22` 단일값.
+
+### per_age (23 테이블)
+| 테이블 | 한글명 | age 출처 |
+|--------|--------|----------|
+| nyzrglyvagmrypezq | 위원회 경력 | column:PROFILE_UNIT_CD |
+| nzmimeepazxkubdpn | 발의법률안 | param:AGE |
+| nuvypcdgahexhvrjt | 상임위 활동 | param:AGE (collector가 __AGE_n로 인코딩) |
+| numwhtqhavaqssfle | 연구단체 등록 | param:AGE |
+| nojepdqqaweusdfbi | 본회의 표결정보 | param:AGE |
+| ncocpgfiaoituanbr | 의안별 표결현황 | param:AGE |
+| BILLRCP | 의안 접수목록 | column:ERACO (제N대 / N대 국회 / 제헌 / 특수기관) |
+| nzivskufaliivfhpb | 역대 의안 통계 | column:ERACO ("N대 국회" 형식) |
+| ncryefyuaflxnqbqo | 청원 처리현황 | param:AGE |
+| nwbpacrgavhjryiph | 본회의 처리안건 | param:AGE |
+| nrvsawtaauyihadij | 인사청문회 | column:AGE |
+| nqfvrbsdafrmuzixe | 날짜별 의정활동 | param:AGE |
+| ngytonzwavydlbbha | 전원위 회의록 | param:AGE |
+| nzbyfwhwaoanttzje | 본회의 회의록 | param:AGE |
+| ncwgseseafwbuheph | 위원회 회의록 | param:AGE |
+| VCONFSUBCCONFLIST | 소위원회 회의록 | column:ERACO |
+| VCONFDETAIL | 회의록 상세 | column:ERACO |
+| VCONFBILLCONFLIST | 의안별 회의록 | column:ERACO |
+| nxcxrdmpaonzzbkic | 외교협의회 | column:UNIT_CD |
+| nbicgazsalnfamoyp | 친선협회 | column:UNIT_CD |
+| nahfbzwvatmaxscwq | 겸직 결정 | column:ORD_NUM |
+| nnzoijvcaiexypqaf | 연구단체 활동 실적 | column:DIV |
+| nfvmtaqoaldzhobsw | 연구용역 보고서 | column:UNIT_CD |
+| ncrwiahparxrpodcv | 연구단체 연구활동 | param:AGE |
+
+### current_only (9 테이블, 모두 age=22)
+| 테이블 | 한글명 | age 출처 |
+|--------|--------|----------|
+| nwvrqwxyaytdsfvhu | 의원 인적사항 | constant:22 |
+| nexgtxtmaamffofof | 의원 이력 | column:UNIT_CD (실측값 22 단일) |
+| negnlnyvatsjwocar | SNS 정보 | constant:22 |
+| nvqbafvaajdiqhehi | 청원 계류현황 | constant:22 |
+| nepjpxkkabqiqpbvk | 정당 의석수 | constant:22 |
+| nxrvzonlafugpqjuh | 위원회 현황 | constant:22 |
+| nktulghcadyhmiqxi | 위원회 위원 명단 | constant:22 |
+| ndiwuqmpambgvnfsj | 위원회 계류법률안 | constant:22 |
+
+### by_date (4 테이블, 5월 30일 임기 시작 경계로 매핑)
+| 테이블 | 한글명 | 날짜 컬럼 |
+|--------|--------|-----------|
+| nbqbmccpamsvwebkn | 정책 세미나 | HOST_DT |
+| npbzvuwvasdqldskm | 기자회견 | TAKING_DATE |
+| nztwkhgzakucszgls | 사업예산 | YR (연도, 6월 30일 기준 매핑) |
+| nmfcjtvmajsbhhckf | 의정보고서 | PUBLISH_DT |
+
+### by_bill_id (1 테이블)
+| 테이블 | 한글명 | 조인 |
+|--------|--------|------|
+| billinfodetail | 의안 상세 | join: billrcp.BILL_ID → ERACO 파싱 |
+
+### BILLRCP 특수 ERACO 값 (음수 age)
+일반 `WHERE age >= 1` 쿼리는 이들을 자동 배제:
+
+| ERACO 원문 | age | 비고 |
+|-----------|-----|------|
+| `국가보위입법회의` | -3 | 1980-1981 |
+| `국가재건최고회의` | -2 | 1961-1963 |
+| `비상국무회의` | -1 | 1972-1973 |
+| `제헌` | 1 | 1948 (제헌국회를 1대로 매핑) |
