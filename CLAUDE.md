@@ -17,9 +17,11 @@ Two distinct but related workstreams share this repo:
 | File | Role |
 |------|------|
 | [prompts.py](prompts.py) | Single source of truth for the 10-attribute `SYSTEM_PROMPT`. Used by both classifiers. |
-| [classify.py](classify.py) | News classifier. Usage: `python classify.py {guardian|nyt|naver|all}`. |
+| [classify_articles.py](classify_articles.py) | News classifier. Usage: `python classify_articles.py {guardian|nyt|naver|all}`. |
 | [classify_bills.py](classify_bills.py) | Bill classifier. Usage: `python classify_bills.py {kr_19|kr_20|kr_21|kr_22|us_118|us_119|eu_act|eu_amendments|all}`. |
 | [bill_loaders.py](bill_loaders.py) | Loader helpers `load_kr_bills()`, `load_us_bills()`, `load_eu_bills()` that join classification with source metadata. All downstream consumers (figures, reports, validators) go through this module — do not re-load `bills_classified_*.json` directly. |
+| [download_bills.py](download_bills.py) | KR bill PDF downloader + fitz text extraction → `bill_text` table. Usage: `python download_bills.py --age 22`. |
+| [download_documents.py](download_documents.py) | Unified PDF/HWP/HWPX downloader + extractor → `document_text` table. Covers 연구단체 보고서 (ncrwiahparxrpodcv) and 5 회의록 API tables. Usage: `python download_documents.py --source SRC` where SRC is one of `report`, `minutes_plenary`, `minutes_committee`, `minutes_committee_of_whole`, `minutes_subcommittee`. See §Document extraction pipeline below. |
 
 Both classifiers load `prompts.SYSTEM_PROMPT`, retry 429s with exponential backoff, and cache successful results in their output JSON (errors get retried on re-run).
 
@@ -31,6 +33,41 @@ Both classifiers load `prompts.SYSTEM_PROMPT`, retry 429s with exponential backo
 - KR analysis convenience view: `v_kr_bills_analysis`
 
 `bill_loaders.py` is now a thin DB wrapper — its public signatures (`load_kr_bills`, `load_us_bills`, `load_eu_bills`) are preserved so all downstream consumers (figures, reports, validators) work unchanged. US/EU sponsor metadata still comes from on-disk JSON (`bills_processed.json`, `eu_ai_act_articles.json`, `eu_amendments.json`); only classification rows moved to DB. Original JSONs are archived under `data/_archive/`.
+
+## Document extraction pipeline (since 2026-04-19)
+
+[PLAN_doc_extraction.md](PLAN_doc_extraction.md) restored the lost PDF/HWP downloader → text-extractor pipeline for 6 API tables that carry attachment URLs. All output lives in `document_text` (PK `(doc_id, source)`) with raw files under `data/docs/{source}/` (gitignored, ~25 GB). See [CODEBOOK.md §13](CODEBOOK.md) for the full coverage matrix.
+
+**Canonical scripts**:
+
+- [migrate_legacy_docs.py](migrate_legacy_docs.py) — one-shot seed from `data/txt/*/{research,report,conf}/*.json` + `data/minutes_txt/*/{본회의,소위원회}/*.json`. Idempotent; ON CONFLICT keeps longer text.
+- [download_documents.py](download_documents.py) — parallel downloader + extractor. Per-source registry (`SOURCES` dict). Single shared DuckDB write connection + lock (DuckDB forbids concurrent writers). Resume on `status IN ('extracted_ok','format_unsupported','url_404','no_url')`; automatic retry on `url_error`/`extract_failed`.
+
+**Format handling**:
+
+- Format detected by magic bytes, not URL extension (`%PDF-` / OLE2 / `PK\x03\x04` + HWPX mimetype check).
+- PDF → fitz (PyMuPDF, `extractor_version='fitz-1.0'`).
+- HWP → `venv/Scripts/hwp5txt.exe` subprocess (`pyhwp 0.1b15`, `extractor_version='hwp5txt-0.1'`). Only needed if any source returns HWP; 2026-04-19 initial run returned 100% PDF.
+- HWPX → zipfile + ElementTree over `Contents/section*.xml`.
+
+**Source coverage (2026-04-19 initial run)**:
+
+| source | API table | rows | status |
+|--------|-----------|------|--------|
+| `research` | `nfvmtaqoaldzhobsw` (소규모 연구용역) | 295 | **seed only — URL cannot be derived** (no direct URL column, `FILE_ID` → portal B0000108 pages do not expose attachments via any scrape-friendly endpoint). Keep as-is; don't retry. |
+| `report` | `ncrwiahparxrpodcv` (연구단체 연구활동) | 1,948 | complete |
+| `minutes_plenary` | `nzbyfwhwaoanttzje` | 1,832 (-3 url_error) | complete |
+| `minutes_committee_of_whole` | `ngytonzwavydlbbha` | 8 | complete |
+| `minutes_subcommittee` | `vconfsubcconflist` | 189 | complete |
+| `minutes_committee` | `ncwgseseafwbuheph` | 22,275 (-8 url_error) | complete |
+
+Total: 26,547 rows, 26,536 `extracted_ok`. All 11 `url_error` entries are persistent 119-byte placeholder responses from `record.assembly.go.kr` for IDs that no longer exist — do not retry.
+
+**Things to remember when touching this pipeline**:
+
+- DuckDB in the same process cannot open a read-only connection while a write connection is open. `download_documents.py` and `classify_bills.py` both use the `_reader_con()` helper (returns the shared write connection if open) — preserve this when editing.
+- `prompt_versions` / `bill_classifications` pattern does NOT apply to `document_text` (extraction is deterministic; `extractor_version` is logged but not PK-versioned). Bumping `fitz` or `hwp5txt` does not require re-extraction unless the new version fixes a known bug.
+- `nfvmtaqoaldzhobsw` URL derivation was investigated in Phase 0 and is not feasible via the public Assembly portal. Do not re-litigate without a new lead (e.g., NARS internal mapping).
 
 ## Korean AI bill selection — 2-stage filter (critical)
 
@@ -46,7 +83,7 @@ US bills (Brennan Center pre-filtered) and EU AI Act (inherently AI-specific) sk
 
 ## News title filter
 
-All three news sources (`guardian/nyt/naver`) apply the same title filter before 10-attribute classification: title must contain `\bAI\b | artificial intelligence | A\.I\. | 인공지능 | 인공 지능`. This is enforced in `classify.py::title_has_kw` so cross-source comparison stays apples-to-apples.
+All three news sources (`guardian/nyt/naver`) apply the same title filter before 10-attribute classification: title must contain `\bAI\b | artificial intelligence | A\.I\. | 인공지능 | 인공 지능`. This is enforced in `classify_articles.py::title_has_kw` so cross-source comparison stays apples-to-apples.
 
 Naver collection itself is multi-stage (see WORKFLOW §2.4); the canonical input JSON is `data/naver_articles_title_filtered.json` (~449 articles, 8 publishers). Do not re-collect Naver from scratch without reading that section.
 
@@ -65,7 +102,7 @@ python download_all.py --status               # progress check
 python download_all.py --api BILLRCP          # one API
 
 # AI pipeline — news
-python classify.py all                        # 3 sources
+python classify_articles.py all                        # 3 sources
 python export_titles.py all                   # group titles by attribute
 
 # AI pipeline — bills
@@ -88,7 +125,7 @@ Both folders are intended as frozen references. Active code lives at the repo ro
 
 ## Output-file hygiene
 
-- News classification still uses JSON files (`news_{source}_classified.json`); bill classification uses DB rows. Both retry errors on re-run.
+- News classification uses JSON files at `data/processed/articles_classified_{guardian,nyt,naver}.json`; bill classification uses DB rows. Both retry errors on re-run. `classify_articles.py` and `classify_bills.py` both support `--force` to purge caches/outputs and reclassify.
 - News classification output filenames are stable — do not introduce v2/v3 suffixed siblings. Bill classification versioning is via `prompt_versions.version` instead.
 - Intermediate Naver files (`naver_articles_v3_raw.json`, `*_clean.json`, `*_filtered.json`, `*_final.json`) are byproducts of the multi-stage pipeline; the analysis-ready one is `naver_articles_title_filtered.json`.
 - `data/_archive/` holds pre-migration JSONs (`bill_txt_*/`, `bills_classified_*.json`, `kr_*_ai_filtered.json`) for ~3 months. Do not read from there — use the DB.
