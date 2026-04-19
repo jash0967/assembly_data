@@ -932,6 +932,49 @@ KR 법안 분석용 통합 뷰. `v_bill` LEFT JOIN `bill_text` LEFT JOIN
 `v_bill_classifications_current` (source LIKE 'kr_%') LEFT JOIN `bill_ai_filter`.
 [`bill_loaders.load_kr_bills`](bill_loaders.py)가 이 뷰를 사용.
 
+### `document_text` — PDF/HWP 추출 결과 통합 (2026-04-19)
+[`download_documents.py`](download_documents.py) + [`migrate_legacy_docs.py`](migrate_legacy_docs.py).
+6개 API 테이블의 첨부 PDF·HWP를 받아 fitz/hwp5txt로 텍스트화.
+
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `doc_id` | VARCHAR | 소스별 자연키 (FILE_ID / CONF_ID / 등) |
+| `source` | VARCHAR | `research` / `report` / `minutes_plenary` / `minutes_committee` / `minutes_committee_of_whole` / `minutes_subcommittee` |
+| `source_table` | VARCHAR | 원천 API 테이블명 |
+| `age` | INTEGER | 대수 |
+| `title` | VARCHAR | 보고서 제목 / 회의명 |
+| `author` | VARCHAR | 발의 의원 / 연구단체명 |
+| `doc_date` | VARCHAR | 회의일 / 보고서 연도 |
+| `url` | VARCHAR | 원본 다운로드 URL |
+| `file_format` | VARCHAR | `pdf` / `hwp` / `hwpx` / `unknown` (매직 바이트 감지) |
+| `file_path` | VARCHAR | 로컬 raw 파일 경로 (`data/docs/{source}/`) |
+| `full_text` | TEXT | 추출된 전체 텍스트 |
+| `text_length` | INTEGER | 문자 수 |
+| `status` | VARCHAR | `extracted_ok` / `url_error` / `url_404` / `format_unsupported` / `extract_failed` / `no_url` |
+| `error_message` | TEXT | 실패 이유 요약 |
+| `extractor_version` | VARCHAR | `fitz-1.0` / `hwp5txt-0.1` / `hwpx-xml-0.1` / `legacy-unknown` |
+| `fetched_at` / `extracted_at` | TIMESTAMP | |
+
+**PK = `(doc_id, source)`** — 같은 `doc_id` 숫자가 다른 소스에서 충돌 가능하므로 분리.
+
+**커버리지 (2026-04-19 1차 실행 후)**:
+
+| source | 테이블 | 건수 | 평균 길이 | 상태 |
+|--------|--------|------|-----------|------|
+| research | nfvmtaqoaldzhobsw | 295 | 53K | 레거시 seed만 (URL 도출 불가) |
+| report | ncrwiahparxrpodcv | 1,948 | 23K | 전체 완료 |
+| minutes_plenary | nzbyfwhwaoanttzje | 1,832 (-3 url_error) | 90K | 완료 |
+| minutes_committee_of_whole | ngytonzwavydlbbha | 8 | 55K | 완료 |
+| minutes_subcommittee | vconfsubcconflist | 189 | 75K | 완료 |
+| minutes_committee | ncwgseseafwbuheph | 22,275 (-8 url_error) | 75K | 완료 |
+| **합계** | — | **26,547** | — | **extracted_ok 26,536 / url_error 11** |
+
+url_error 11건은 모두 `record.assembly.go.kr` 서버가 119바이트 placeholder를 반환하는 비가용 ID (실제 회의록 없음).
+
+원본 raw 파일(~25GB PDF)은 `data/docs/{source}/`에 유지 (gitignore). 파일 포맷은 매직 바이트로 감지하며, 이번 실행에서는 전부 PDF — HWP 샘플 확보되면 `hwp5txt` CLI 자동 디스패치.
+
+`research` 소스의 `nfvmtaqoaldzhobsw` (소규모 연구용역)는 URL 컬럼이 없고 `FILE_ID`만 존재. 국회 포털 B0000108 상세 페이지가 첨부를 노출하지 않아 URL 도출 불가. 레거시 `data/txt/*/research/` 의 295건만 seed로 보존 (가능해지면 추후 확장).
+
 ---
 
 ## AGE 컬럼 출처표

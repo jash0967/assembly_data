@@ -82,9 +82,9 @@ def validate(con, verbose: bool = False) -> list[str]:
         if verbose:
             print(f"  ok {t} [{spec.age_behavior}] rows={rows:,} null=0")
 
-    # Phase 3/4 schemas
+    # Phase 3/4 schemas + doc pipeline (Phase 8)
     for required in ("bill_text", "bill_classifications", "bill_ai_filter",
-                     "prompt_versions"):
+                     "prompt_versions", "document_text"):
         if not _table_exists(con, required):
             errors.append(f"missing schema: {required}")
 
