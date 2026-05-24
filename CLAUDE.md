@@ -90,43 +90,20 @@ Two distinct news layers since 2026-05-21:
 
 2. **Domestic Korean (KBS, MBC, SBS, YTN, 중앙일보, 한겨레)** — 157,886 articles (2018~2026) consolidated into `data/news/news.duckdb` (`news_articles` table, PK = `news_id`). Source JSONs archived under `data/news/raw_news_archive/` (gitignored). The earlier Naver Search API pipeline was retired with this dataset.
 
-### 한국 도메스틱 뉴스 Strict AI 필터 (since 2026-05-22)
+### 한국 도메스틱 뉴스 Strict AI 필터
 
-공급사(Newstore)가 word boundary 없는 단순 substring 매칭으로 데이터셋을 구성해 KAIST·KAI·인스타그램 핸들·`인공강우` 같은 부분문자열이 잡혀 21.6% (34,066건)가 AI 무관 일반 뉴스로 누수됨. 추가로 **MBC가 2025년부터 모든 기사 footer에 `(AI학습 포함) 금지` boilerplate를 부착해 2025년 MBC 24,259건 중 99.2%가 false positive로 잡힘** (다른 매체 0%). 이 두 발견에 대응해 `analyze/news_descriptive.py::STRICT_WHERE`에 정밀 필터 정의:
+한국 도메스틱 뉴스는 4규칙 Strict 필터로 정제 후 10속성 분류 → `news.duckdb::news_classifications` (PK `news_id × prompt_version`).
 
-```sql
-(
-  ( REPLACE(REPLACE(content, '(AI학습 포함)', ''), '(AI 학습 포함)', '') ILIKE '%인공지능%'
-    OR title ILIKE '%인공지능%'
-    OR ... 인공 지능 / AI(word boundary) / A.I / A.I. / artificial intelligence ...
-  )
-  AND NOT (  -- 영문 본문 제외 (한국 도메스틱 담론 분석 범위 일치)
-    LENGTH(content) > 200
-    AND LENGTH(regexp_replace(content,'[가-힣]','','g'))::FLOAT/LENGTH(content) > 0.95
-  )
-)
-```
+- **필터 정의**: [analyze/news_cleaning.py](analyze/news_cleaning.py) — `STRICT_WHERE` SQL export
+- **규칙·근거·매체별 통계**: [analyze/news_cleaning.md](analyze/news_cleaning.md)
+- **실행 흐름**: [WORKFLOW.md §3.5](WORKFLOW.md)
+- **분류 스크립트**: [analyze/classify_news_kr.py](analyze/classify_news_kr.py) (sync) / [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) (Batch API, 50% 할인)
 
-**3가지 강화 포인트**:
+추가 자료:
 
-1. **boilerplate substring 정밀 제거**: `(AI학습 포함)` / `(AI 학습 포함)`만 정확히 제거. 본문 진짜 `AI학습`·`AI 학습` 표현은 보존 (본문 실사용 716건, 진짜 false negative 1건 수준).
-2. **Word boundary 영문 매칭**: `regexp_matches((^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$))`로 KAIST·KAI·hawaii·airmail false positive 차단. 한글 char는 비알파넘이라 `AI학습`의 `AI` word boundary 매칭은 정상 동작.
-3. **영문 본문 자동 제외**: 한글 5% 미만 + 200자 이상이면 외신용 영문 단신(YTN 207건)으로 판정해 제외. 한국 도메스틱 담론 분석 범위와 일치.
-
-> 초기에 검토한 `artificial intelligence` 풀스펠 키워드는 영문 본문 제외와 완전 중복이라 폐기 (한국어 본문에 풀스펠만 단독 등장하는 케이스 0건 확인).
-
-**결과**: raw 157,886 → Strict 통과 **94,029건 (59.6%)**. 누수 63,857건 자동 배제.
-
-매체별 통과율: KBS 87.8% / SBS 84.6% / YTN 74.4% / 중앙 69.5% / 한겨레 63.5% / **MBC 8.8%** (boilerplate 효과 정화 후 진짜 AI 보도만). MBC raw 2025년 폭증(614 → 24,259, ×40)은 큐레이션 변경이 아니라 boilerplate 단일 원인이며, 진짜 AI 보도(Strict 통과)는 2018 169건 → 2025 977건 자연 증가 패턴.
-
-**구현·재현**:
-- 필터 정의: [analyze/news_descriptive.py](analyze/news_descriptive.py) (`STRICT_WHERE`, `load_strict_*` 함수들)
-- 그림: `figures/news_strict_*.png` (4개), Excel 시트 `news_s01~s04` in `figures/figures_data.xlsx`
 - 방법론 전문: [data/exports/news_filtering_process.md](data/exports/news_filtering_process.md)
-- 이슈 정리(공급사 발송용): [data/exports/news_dataset_issues.md](data/exports/news_dataset_issues.md)
+- 공급사 이슈 정리: [data/exports/news_dataset_issues.md](data/exports/news_dataset_issues.md)
 - 정화 후 descriptive stats: [data/exports/news_descriptive_strict.md](data/exports/news_descriptive_strict.md)
-
-**향후 분류**: GPT 10속성 분류는 raw 157,886이 아니라 Strict 통과 94,029건을 입력으로 사용 권장 (~$78 비용, raw 대비 $52 절감 + 노이즈 자동 배제). 메타적 AI(중앙일보 로봇기자 372건)는 Strict 필터가 자동 배제(통과 0건)하므로 별도 처리 불필요. 영문 본문 207건 분리 분석이 필요하면 `STRICT_WHERE`의 `AND NOT (...)` 영문 제외 조항만 제거하면 재조회 가능.
 
 ## Assembly DuckDB access (split since 2026-05-09)
 

@@ -14,6 +14,7 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+import duckdb
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -24,11 +25,48 @@ from hdbscan import HDBSCAN
 from sklearn.feature_extraction.text import CountVectorizer
 from openai import OpenAI
 from dotenv import load_dotenv
+from kiwipiepy import Kiwi
 
 load_dotenv()
 
 import _bootstrap  # noqa: F401
 import config
+from news_cleaning import STRICT_WHERE, CLEANED_CONTENT_SQL  # type: ignore[import-not-found]
+
+KR_PROMPT_VERSION = "v2_en_20260418"
+KR_BODY_CHAR_CAP  = 1500
+
+
+# ─── Kiwi 토크나이저 (KO 명사 추출, 조사 결합형 해소) ───
+_kiwi = Kiwi()
+# 데이터 기반: Kiwi 기본 사전이 분리하는 핵심 어휘만 등록
+KIWI_USER_WORDS = [
+    # AI 핵심어
+    "인공지능", "딥페이크", "자율주행", "데이터센터", "빅테크",
+    "안면인식", "생성형", "머신러닝", "딥러닝",
+    # AI 정책·범죄 키워드
+    "딥페이크 성범죄", "디지털 성범죄", "가짜뉴스",
+    "전세사기", "유심해킹", "개인정보",
+    # 혼합 표기
+    "챗GPT", "SK하이닉스",
+    # 기타
+    "G7", "정상회담",
+]
+for _w in KIWI_USER_WORDS:
+    _kiwi.add_user_word(_w, "NNP", 10.0)
+
+KO_NOUN_TAGS = {"NNG", "NNP", "SL"}   # 일반명사·고유명사·외래어
+_PUNCT_TAIL = re.compile(r"[^A-Za-z가-힣\d]+$")
+
+def ko_tokenizer(text):
+    out = []
+    for t in _kiwi.tokenize(text):
+        if t.tag not in KO_NOUN_TAGS:
+            continue
+        form = _PUNCT_TAIL.sub("", t.form)
+        if len(form) >= 2:
+            out.append(form)
+    return out
 
 OUTPUT   = os.path.join(config.ANALYSIS_DIR, "subtopics_bertopic.json")
 client   = OpenAI()
@@ -43,7 +81,9 @@ KR_TO_EN = dict(zip(ATTRS_KR, ATTRS_EN))
 NORMALIZE = {v: k for k, v in KR_TO_EN.items()}
 NORMALIZE['Market efficiency and power concentration (antitrust)'] = '시장경쟁/독과점'
 
-MERGE_THRESHOLD = 0.62   # 이 값 이상이면 EN-KO 토픽 병합
+SBERT_MODEL     = "BAAI/bge-m3"   # 다국어 임베딩 (1024-dim, XLM-R-large 백본)
+SBERT_BATCH     = 16              # BGE-M3는 VRAM 더 씀 (MiniLM 64 → 16)
+MERGE_THRESHOLD = 0.68            # BGE-M3는 sim 분포가 더 높게 깔려 0.62 → 0.68 재캘리브
 
 BASE_STOPWORDS = [
     'ai','artificial','intelligence','the','and','for','that','with',
@@ -198,6 +238,45 @@ def load_news():
             text = text_map.get(a.get("article_id",""),"")
             if len(text) > 20:
                 articles.append({"text":text,"source":source,"attr":attr,"lang":lang})
+
+    # ── KR domestic news (news.duckdb) ──
+    con = duckdb.connect(config.NEWS_DB_PATH, read_only=True)
+    con.execute("PRAGMA disable_progress_bar")
+    kr_sql = f"""
+      SELECT n.title,
+             SUBSTR(({CLEANED_CONTENT_SQL}), 1, {KR_BODY_CHAR_CAP}) AS body,
+             n.provider,
+             c.primary_attr
+      FROM news_articles n
+      JOIN news_classifications c
+        ON c.news_id = n.news_id
+       AND c.prompt_version = '{KR_PROMPT_VERSION}'
+       AND c.error IS NULL
+       AND c.primary_attr IS NOT NULL
+       AND c.primary_attr <> 'none'
+      WHERE {STRICT_WHERE}
+    """
+    kr_rows = con.execute(kr_sql).fetchall()
+    con.close()
+    n_kr_loaded = 0
+    n_kr_skipped_label = 0
+    for title, body, provider, primary in kr_rows:
+        attr = NORMALIZE.get(primary)
+        if attr not in ATTRS_KR:
+            n_kr_skipped_label += 1
+            continue
+        text = clean_text(f"{title or ''}. {body or ''}")
+        if len(text) > 20:
+            articles.append({
+                "text":   text,
+                "source": provider,
+                "attr":   attr,
+                "lang":   "ko",
+            })
+            n_kr_loaded += 1
+    print(f"  KR domestic news loaded: {n_kr_loaded:,}건 "
+          f"(label miss {n_kr_skipped_label}건)")
+
     return articles
 
 
@@ -205,26 +284,41 @@ def load_news():
 # 단일 언어 BERTopic 실행 → 임베딩 포함 반환
 # ──────────────────────────────────────────────
 def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
+    import time as _t
     n = len(texts)
-    print(f"    [{lang_tag}] {n}건 임베딩...", flush=True)
-    embeddings = sbert.encode(texts, show_progress_bar=False, batch_size=64)  # (n, 384)
+    print(f"    [{lang_tag}] {n}건 임베딩 시작...", flush=True)
+    _t0 = _t.time()
+    embeddings = sbert.encode(texts, show_progress_bar=True,
+                               batch_size=SBERT_BATCH,
+                               normalize_embeddings=True,
+                               device='cuda')   # (n, 1024)
+    print(f"    [{lang_tag}] 임베딩 완료: {_t.time()-_t0:.1f}s, shape={embeddings.shape}", flush=True)
 
     stopwords = BASE_STOPWORDS + ATTR_EXTRA_STOPWORDS.get(attr, [])
-    mcs        = max(5, n // 60)
+    # BGE-M3 응집 강해 mcs 공식·min_samples·cluster_selection_method 재튜닝 (2026-05-24)
+    mcs        = max(8, n // 200)
     n_comp     = 10 if n > 800 else 5
-    n_neigh    = 20 if n > 800 else 15
+    n_neigh    = 15
 
     print(f"    min_cluster_size={mcs}, n_comp={n_comp}, n_neigh={n_neigh}")
+
+    if lang_tag == "en":
+        vectorizer_model = CountVectorizer(
+            stop_words=stopwords, min_df=2, ngram_range=(1, 2),
+            token_pattern=r'(?u)\b[a-zA-Z가-힣]{2,}\b')
+    else:  # "ko" or "mixed" — Kiwi 명사 추출로 조사 결합형 해소
+        vectorizer_model = CountVectorizer(
+            tokenizer=ko_tokenizer, lowercase=False,
+            stop_words=stopwords, min_df=2, ngram_range=(1, 1))   # 진단: ngram=(1,1)
 
     topic_model = BERTopic(
         embedding_model=sbert,
         umap_model=UMAP(n_neighbors=n_neigh, n_components=n_comp,
                         min_dist=0.0, metric='cosine', random_state=42),
-        hdbscan_model=HDBSCAN(min_cluster_size=mcs, min_samples=3,
-                               metric='euclidean', prediction_data=True),
-        vectorizer_model=CountVectorizer(
-            stop_words=stopwords, min_df=2, ngram_range=(1,2),
-            token_pattern=r'(?u)\b[a-zA-Z가-힣]{2,}\b'),
+        hdbscan_model=HDBSCAN(min_cluster_size=mcs, min_samples=1,
+                               metric='euclidean', prediction_data=True,
+                               cluster_selection_method='leaf'),
+        vectorizer_model=vectorizer_model,
         representation_model=KeyBERTInspired(),
         seed_topic_list=SEED_TOPICS.get(attr),
         nr_topics="auto",
@@ -411,7 +505,18 @@ Respond ONLY with JSON: {{"en": "English label", "ko": "Korean label"}}"""
 # ──────────────────────────────────────────────
 # 속성별 전체 파이프라인
 # ──────────────────────────────────────────────
-def process_attr(articles, attr, sbert):
+def label_topic_keywords_only(topic):
+    if topic.get("type") == "merged":
+        kw = (topic.get("keywords_en", [])[:2] + topic.get("keywords_ko", [])[:2]) or topic.get("keywords", [])[:4]
+    else:
+        kw = topic.get("keywords", [])[:3]
+    label = ", ".join(kw)
+    topic["label_en"] = label
+    topic["label_ko"] = label
+    return topic
+
+
+def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
     subset  = [a for a in articles if a["attr"] == attr]
     n_total = len(subset)
     if n_total < 20:
@@ -456,14 +561,22 @@ def process_attr(articles, attr, sbert):
         n_outliers = sum(1 for t in topics if t==-1)
         merged, en_only, ko_only = [], [], all_topics
 
-    # ── GPT 라벨링 ──
+    # ── 라벨링 ──
     attr_en = KR_TO_EN.get(attr, attr)
-    print(f"\n  GPT 라벨링 ({len(all_topics)}개 토픽)...")
-    for topic in all_topics:
-        topic = label_topic(topic, attr_en)
-        t_type = topic.get("type","?")
-        sym = "🔗" if t_type=="merged" else ("EN" if t_type=="en_only" else ("KO" if t_type=="ko_only" else "~~"))
-        print(f"  [{sym}] ({topic['count']}건) {topic.get('label_ko','')} / {topic.get('label_en','')}")
+    if skip_gpt_label:
+        print(f"\n  키워드 라벨링 ({len(all_topics)}개 토픽, GPT 스킵)...")
+        for topic in all_topics:
+            label_topic_keywords_only(topic)
+            t_type = topic.get("type","?")
+            sym = "🔗" if t_type=="merged" else ("EN" if t_type=="en_only" else ("KO" if t_type=="ko_only" else "~~"))
+            print(f"  [{sym}] ({topic['count']}건) {topic.get('label_ko','')}")
+    else:
+        print(f"\n  GPT 라벨링 ({len(all_topics)}개 토픽)...")
+        for topic in all_topics:
+            topic = label_topic(topic, attr_en)
+            t_type = topic.get("type","?")
+            sym = "🔗" if t_type=="merged" else ("EN" if t_type=="en_only" else ("KO" if t_type=="ko_only" else "~~"))
+            print(f"  [{sym}] ({topic['count']}건) {topic.get('label_ko','')} / {topic.get('label_en','')}")
 
     return {
         "n_articles": n_total,
@@ -492,6 +605,8 @@ def clean_for_save(results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--attr", nargs="+")
+    parser.add_argument("--no-label", action="store_true",
+                        help="GPT 라벨링 스킵 (키워드 상위 3개를 라벨로 사용)")
     args = parser.parse_args()
 
     print("=== BERTopic v4: 언어 분리 + 의미 정렬 ===\n")
@@ -506,8 +621,11 @@ def main():
 
     target = args.attr or ATTRS_KR
 
-    print("\nLoading SBERT model...")
-    sbert = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    print(f"\nLoading SBERT model: {SBERT_MODEL} ...")
+    import torch
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+    sbert = SentenceTransformer(SBERT_MODEL, device=_device)
+    print(f"  device: {sbert.device}, cuda_available: {torch.cuda.is_available()}", flush=True)
 
     # 기존 결과 로드 (부분 실행 시 병합)
     existing = {}
@@ -519,7 +637,7 @@ def main():
     for attr in ATTRS_KR:
         if attr not in target:
             continue
-        res = process_attr(articles, attr, sbert)
+        res = process_attr(articles, attr, sbert, skip_gpt_label=args.no_label)
         if res:
             results[attr] = res
 

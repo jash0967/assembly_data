@@ -3,30 +3,22 @@
 > 이 문서는 본 프로젝트의 모든 데이터 흐름, 필터 기준, 분류 방법, 산출물을 단일 참고자료로 기록.
 > 보고서 [report_expanded_draft.md](report_expanded_draft.md)와 함께 본 파이프라인이 정본.
 
-> **2026-05-21 (current) — data/ 도메인 재구성 + 한국 신문기사 데이터셋 교체**
+> **2026-05-22 (current) — 한국 도메스틱 뉴스 Strict 필터 + 10속성 분류 완료**
 >
-> 1. **data/ 폴더 도메인별 분리**:
->    - `data/bills_kr/` — `assembly_raw.duckdb`, `assembly_analysis.duckdb`, `pdf_archives/{19..22}/`, `docs/`
->    - `data/bills_us/` — `congress.duckdb`
->    - `data/bills_eu/` — `eu_ai_act_*`, `eu_amendments_*`
->    - `data/news/` — `news.duckdb` (KR domestic), NYT/Guardian JSON, `raw_news_archive/`(gitignored)
->    - `data/analysis/` — JSON 산출물 (classifications, subtopics, treemap, tfidf, outliers, ...)
->    - `data/exports/` — 사람 열람용 마크다운 (`bills_*.md`, `titles_*.md`)
->    - `data/_archive/`, `data/_audit/` — 그대로
->    - `bill_text.pdf_path` 컬럼은 `data/bills_kr/pdf_archives/{age}/` 형식으로 SQL UPDATE 완료 (77,104행)
+> 1. **Strict AI 필터 신설** ([analyze/news_cleaning.py](analyze/news_cleaning.py)):
+>    - 공급사 substring 매칭 누수 + 매체별 boilerplate footer 정제 (4규칙)
+>    - 정의·근거 상세: [analyze/news_cleaning.md](analyze/news_cleaning.md)
 >
-> 2. **Naver 뉴스 파이프라인 폐기 + 정식 KR 도메스틱 뉴스 도입**:
->    - Naver Search API 기반 수집(`collect_naver_v3.py` 등)·데이터·`articles_classified_naver.json`·관련 figure 페어 모두 제거
->    - 6개 매체 KBS/MBC/SBS/YTN/중앙일보/한겨레, 2018~2026 약 157K 기사 → `data/news/news.duckdb::news_articles`
->    - 적재 스크립트: [collect/build_news_db.py](collect/build_news_db.py)
+> 2. **한국 도메스틱 10속성 분류** → `news.duckdb::news_classifications` 테이블:
+>    - [analyze/classify_news_kr.py](analyze/classify_news_kr.py) (sync) / [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) (Batch API)
 >
 > **이전 변경 이력**
 >
-> - 2026-05-10 — 스크립트 폴더 분리 (`collect/`, `analyze/`, `figures/`), DB raw/analysis 분리 (`PLAN_db_split.md`, 정리됨)
-> - 2026-04-18 — `bill_txt_*/*.json` (77K) → `bill_text`, `bills_classified_*.json` → `bill_classifications`, `kr_*_ai_filtered.json` → `bill_ai_filter`. 모든 per-age 테이블에 `age INTEGER` 주입.
->
-> 본 문서의 파일경로 표현(예: "bill_txt_22/...")은 이제 논리적 의미만 가지며 실제 위치는 DB.
-> 자세한 출처는 [CODEBOOK.md](CODEBOOK.md)와 [`bill_loaders.py`](bill_loaders.py) 참고.
+> - 2026-05-21 — data/ 폴더 도메인 분리 + KR 도메스틱 뉴스 정식 도입 (`news.duckdb`), Naver 파이프라인 폐기
+> - 2026-05-10 — 스크립트 폴더 분리 (`collect/`, `analyze/`, `figures/`), DB raw/analysis 분리
+> - 2026-04-18 — `bill_txt_*/*.json` → `bill_text`, `bills_classified_*.json` → `bill_classifications`, `kr_*_ai_filtered.json` → `bill_ai_filter`. 모든 per-age 테이블에 `age INTEGER` 주입.
+
+본 문서의 파일경로 표현은 논리적 의미만 가지며 실제 위치는 DB. 자세한 출처는 [CODEBOOK.md](CODEBOOK.md)와 [`bill_loaders.py`](bill_loaders.py) 참고.
 
 ---
 
@@ -121,15 +113,15 @@ Carvão Appendix II 기준 정본:
 #### 한국 도메스틱 6개 매체 — `data/news/news.duckdb`
 - **소스**: 외부 라이선스로 입수한 정식 아카이브 — KBS, MBC, SBS, YTN, 중앙일보, 한겨레
 - **기간**: 2018-01 ~ 2026-05
-- **규모**: 157,886건 (AI 키워드 필터 적용 전 전체)
+- **규모**: 157,886건 (Strict 필터 적용 전 전체)
 - **원본 JSON**: `data/news/raw_news_archive/{매체}/{년}/{월}/{일}/*.json` (gitignored, 약 665 MB)
 - **DB 적재**: [collect/build_news_db.py](collect/build_news_db.py) → `news_articles` 테이블 (PK = `news_id`)
 - **스키마 필드**: `news_id`, `title`, `content`(전문), `dateline`, `published_at`, `enveloped_at`, `provider`, `byline`, `provider_link_page`, `category`(JSON 배열), `hilight`
-- **AI 키워드 필터링·10속성 분류**: 별도 후속 작업으로 진행 (이번 reorg 범위 밖)
+- **Strict 필터 + 10속성 분류** → `news.duckdb::news_classifications` (§3.5, §4.2 참조)
 
 ---
 
-## 3. AI 관련성 필터 (법안 대상)
+## 3. AI 관련성 필터
 
 ### 3.1 한국 국회 법안 — 2단계 필터 (정본)
 
@@ -160,31 +152,43 @@ Carvão Appendix II 기준 정본:
 ### 3.3 EU AI Act
 - **별도 필터 불필요**: 전체가 AI 규제 법안. 조문 116개 + 수정안 771건 모두 분류 대상.
 
-### 3.4 뉴스 (전 소스 공통)
+### 3.4 영문 뉴스 (Guardian / NYT)
 - **섹션/desk 필터**: Guardian 14개 섹션, NYT 12개 desk 화이트리스트 (수집 단계).
 - **제목 키워드 필터** ([analyze/classify_articles.py](analyze/classify_articles.py) 내 `title_has_kw`): 제목에 `\bAI\b | artificial intelligence | A.I.` 중 하나 포함. Guardian/NYT 양쪽 동일 적용.
-- **한국 도메스틱 뉴스**: 별도 파이프라인. `news.duckdb`에 전체 보관 후 AI 키워드(`인공지능 | AI | A.I.`) 필터링은 후속 단계에서 수행.
+
+### 3.5 한국 도메스틱 뉴스 — Strict AI 필터
+
+- **정의**: [analyze/news_cleaning.py](analyze/news_cleaning.py) — `STRICT_WHERE` SQL 조각으로 export
+- **상세 규칙·근거**: [analyze/news_cleaning.md](analyze/news_cleaning.md)
+- **import 패턴**: `from news_cleaning import STRICT_WHERE` 후 `WHERE {STRICT_WHERE}` 삽입
+- **소비자**: [analyze/classify_news_kr.py](analyze/classify_news_kr.py), [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py), [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py), [analyze/news_descriptive.py](analyze/news_descriptive.py) (역호환 re-export)
 
 ---
 
-## 4. 10속성 분류 — [analyze/classify_articles.py](analyze/classify_articles.py) / [analyze/classify_bills.py](analyze/classify_bills.py)
+## 4. 10속성 분류 — [analyze/classify_articles.py](analyze/classify_articles.py) / [analyze/classify_bills.py](analyze/classify_bills.py) / [analyze/classify_news_kr.py](analyze/classify_news_kr.py)
 
 ### 4.1 공통 사양
 - **프롬프트**: [prompts.py](prompts.py)의 `SYSTEM_PROMPT` (영문 v2, 뉴스·법안 공용)
 - **모델**: `gpt-4.1-mini`, `temperature=0`, `response_format=json_object`
 - **출력 형식**: `{"primary": "<Label>", "secondary": "<Label or none>", "tertiary": "<Label or none>"}`
 - **라벨 공간**: 10속성 영문 문자열 + `"none"`
-- **병렬**: ThreadPoolExecutor (워커 4) + 429 rate-limit exponential backoff
-- **캐시**: 각 출력 JSON에서 error 항목만 재시도, success는 재사용
-- **출력 필드**: `primary`, `secondary`, `tertiary`, `article_id` 또는 `id`, `title`
+- **병렬**: ThreadPoolExecutor + 429 rate-limit exponential backoff
+- **캐시**: 각 출력 JSON 또는 DB 테이블에서 error 항목만 재시도, success는 재사용
+- **출력 필드**: `primary`, `secondary`, `tertiary`, `news_id`/`article_id`/`bill_id`, `title`
 
-### 4.2 뉴스 분류 (Guardian / NYT)
+### 4.2 뉴스 분류
+
+#### Guardian / NYT
 - 입력: 제목 + description(150자 스니펫)
-- 타겟 키워드 필터 거친 후 분류
-- 출력:
-  - `data/analysis/articles_classified_guardian.json` (2,310건)
-  - `data/analysis/articles_classified_nyt.json` (1,326건)
-- 한국 도메스틱 뉴스(news.duckdb)는 별도 후속 파이프라인에서 분류 (이번 reorg에선 인프라만 정비)
+- 출력: `data/analysis/articles_classified_{guardian,nyt}.json`
+
+#### 한국 도메스틱
+- 입력: §3.5 Strict 통과 행, 제목 + 본문 (cap 30,000자)
+- 출력: `news.duckdb::news_classifications` (PK `news_id × prompt_version`)
+- 스크립트:
+  - [analyze/classify_news_kr.py](analyze/classify_news_kr.py) — sync (smoke test·소량용)
+  - [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) — Batch API (대량 production, 50% 할인)
+- 메타: `news.duckdb::news_prompt_versions`
 
 ### 4.3 법안 분류
 - 입력: 법안명 + 제안이유 앞 2,000자 (KR) / 법안 원문 앞 3,000자 (US) / 조문 앞 2,500자 (EU)
@@ -210,11 +214,14 @@ Carvão Appendix II 기준 정본:
 | [replicate_carvao/02_collect_bill_details.py](replicate_carvao/02_collect_bill_details.py) | US 118대 법안 상세 |
 | [replicate_carvao/us119_run_all.py](replicate_carvao/us119_run_all.py) | US 119대 전체 파이프라인 |
 
-### 5.2 분류
+### 5.2 필터·분류
 | 스크립트 | 역할 |
 |----------|------|
 | [prompts.py](prompts.py) | 통일 10속성 분류 프롬프트 (v2 영문) |
+| [analyze/news_cleaning.py](analyze/news_cleaning.py) | 한국 도메스틱 뉴스 Strict AI 필터 정의 (모듈) |
 | [analyze/classify_articles.py](analyze/classify_articles.py) | 영문 뉴스 분류 (Guardian/NYT) |
+| [analyze/classify_news_kr.py](analyze/classify_news_kr.py) | 한국 도메스틱 뉴스 분류 — sync |
+| [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) | 한국 도메스틱 뉴스 분류 — Batch API (50% 할인) |
 | [analyze/classify_bills.py](analyze/classify_bills.py) | 법안 분류 (KR 2단계 필터 포함 + US + EU) |
 
 ### 5.3 내보내기
@@ -250,8 +257,9 @@ Carvão Appendix II 기준 정본:
 │ NYT Archive API      │    │ desk 12개 + 키워드 2중 │    │  gpt-4.1-mini        │
 │   → nyt_raw          │    │ 제목 AI 키워드 필터    │    │  temperature=0       │
 │                      │    │                        │    │  JSON output         │
-│ 한국 6매체 정식 archive│    │ (이번 reorg는 적재만)  │    │  {primary, sec, ter} │
-│   → news.duckdb 157K │    │                        │    │                      │
+│ 한국 6매체 archive   │    │ Strict 필터 4규칙       │    │  classify_news_kr*.py│
+│   → news.duckdb      │    │ (news_cleaning.py)     │    │  → news_classifications│
+│   news_articles      │    │                        │    │                      │
 │                      │    │                        │    │                      │
 │ KR Open API          │    │ Stage 1: 키워드 3회+   │    │                      │
 │   → bill_text (DB)   │    │ Stage 2: GPT core/adj/ │    │                      │
@@ -296,8 +304,9 @@ python collect/collect_guardian.py                          # Guardian Content A
 python collect/collect_nyt.py                               # NYT Archive API
 python collect/build_news_db.py                             # 한국 6매체 archive → data/news/news.duckdb
 
-# 6. 분류 (analysis DB로 write)
+# 6. 분류 (analysis DB · news.duckdb로 write)
 python analyze/classify_articles.py all                     # Guardian + NYT
+python analyze/classify_news_kr_batch.py full               # 한국 도메스틱 (Batch API 권장)
 python analyze/classify_bills.py all                        # 법안 6소스 (KR 2단계 포함)
 
 # 7. 내보내기
@@ -309,39 +318,35 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 ```
 
 ### 재실행 (캐시 활용)
-- 모든 `classify*.py`는 출력 JSON 존재 시 **error 항목만 재시도**, 성공 항목은 재사용
+- 모든 `classify*.py`는 출력 JSON·DB 행 존재 시 **error 항목만 재시도**, 성공 항목은 재사용
 - Stage 2 결과는 `bill_ai_filter` 테이블에 캐시 — `PROMPT_VERSION` 매칭 시 재사용으로 GPT 필터 비용 절감
 - `build_news_db.py`는 PK(`news_id`) `INSERT OR IGNORE`로 idempotent — 재실행 시 신규 행만 적재
+- `classify_news_kr*.py`는 `news_classifications` PK(`news_id × prompt_version`) 매칭 시 skip
 
 ---
 
 ## 8. 주요 출력 파일 체크리스트
 
 ### 데이터베이스 (정본)
-- [ ] `data/bills_kr/assembly_raw.duckdb` (~7.3 GB) — 37 API + bill_text 77K + document_text 26K + speeches 84K
-- [ ] `data/bills_kr/assembly_analysis.duckdb` (~3 MB) — bill_classifications 1,363 + bill_ai_filter 331 + speech_issues 96K + 분석 뷰
+- [ ] `data/bills_kr/assembly_raw.duckdb` — 37 API + bill_text + document_text + speeches
+- [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + 분석 뷰
 - [ ] `data/bills_us/congress.duckdb` — US 118·119 Congress API 수집물
-- [ ] `data/news/news.duckdb` — 한국 6매체 도메스틱 뉴스 157,886건 (`news_articles` 테이블)
+- [ ] `data/news/news.duckdb` — `news_articles` + **`news_classifications`** + `news_prompt_versions`
 
 ### 원본 수집 (JSON, 일부는 DB로 흡수됨)
-- [ ] `data/news/guardian_articles_raw.json` (11,120)
-- [ ] `data/news/nyt_articles_raw.json` (3,108)
-- [ ] `data/news/raw_news_archive/{매체}/{년}/{월}/{일}/*.json` (157,886, gitignored)
-- [ ] ~~`data/bill_txt_{19,20,21,22}/*.json` (77K)~~ → **DB**: `assembly_raw.bill_text` (구 JSON은 `data/_archive/`)
-- [ ] `data/bills_eu/eu_ai_act_articles.json` (116)
-- [ ] `data/bills_eu/eu_amendments.json` (771)
-- [ ] `replicate_carvao/data/bills_processed.json` (US 118, 154)
-- [ ] `replicate_carvao/data/us119_bills_processed.json` (US 119, 53)
-
-### 필터·전처리
-- [ ] Stage 2 KR AI bill 필터 → **DB**: `assembly_analysis.bill_ai_filter` (PROMPT_VERSION으로 버전 분리)
+- [ ] `data/news/guardian_articles_raw.json`
+- [ ] `data/news/nyt_articles_raw.json`
+- [ ] `data/news/raw_news_archive/{매체}/{년}/{월}/{일}/*.json` (gitignored)
+- [ ] `data/bills_eu/eu_ai_act_articles.json`
+- [ ] `data/bills_eu/eu_amendments.json`
+- [ ] `replicate_carvao/data/bills_processed.json` (US 118)
+- [ ] `replicate_carvao/data/us119_bills_processed.json` (US 119)
 
 ### 10속성 분류 결과
-- [ ] `data/analysis/articles_classified_guardian.json` (2,310) — 영문 뉴스만 JSON 유지
-- [ ] `data/analysis/articles_classified_nyt.json` (1,326)
-- [ ] ~~`data/processed/bills_classified_*.json`~~ → **DB**: `assembly_analysis.bill_classifications`
-      (source 컬럼: `kr_19/20/21/22`, `us_118/119`, `eu_act/amendments`)
-- [ ] 한국 도메스틱 뉴스 10속성 분류 → 후속 작업 (이번 reorg 범위 밖)
+- [ ] `data/analysis/articles_classified_guardian.json` — 영문 뉴스
+- [ ] `data/analysis/articles_classified_nyt.json`
+- [ ] **DB**: `news.duckdb::news_classifications` — 한국 도메스틱 뉴스
+- [ ] **DB**: `assembly_analysis.bill_classifications` — 법안 6소스
 
 ### 사람 열람용 마크다운
 - [ ] `data/exports/titles_{guardian,nyt}_by_category.md`
@@ -369,24 +374,32 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 - **Why**: 16만 파일을 그대로 두면 파이프라인 입력 단계마다 디렉토리 walk · JSON 파싱 비용이 폭발. DB 한 곳에서 인덱싱(`provider`, `published_at`) · SQL 필터 가능. PK가 `news_id`라 `INSERT OR IGNORE`로 idempotent.
 
 ### 9.4 뉴스 제목 키워드 필터 최종 적용
-- **What**: 수집·분류가 끝난 뒤에도 "제목에 AI 키워드" 조건으로 1차 scope 좁혀 비교 정본 수집물 확정
+- **What**: 수집·분류가 끝난 뒤에도 "제목에 AI 키워드" 조건으로 1차 scope 좁혀 비교 정본 수집물 확정 (Guardian/NYT)
 - **Why**: 동일 조건을 세 소스에 적용해야 비교 공정성 유지. 본문만 AI 언급하고 제목은 다른 주제인 기사는 국가 간 담론 비교에서 편향 유발.
 
 ---
 
 ## 10. 작업 이력 주요 분기
 
+### 2026-05-22 — 한국 도메스틱 뉴스 Strict 필터 + 10속성 분류
+- 공급사 substring 매칭 누수·매체별 boilerplate footer 정제 위한 Strict 필터 4규칙 설계
+- `news_cleaning.py` 모듈 분리, 문서 `news_cleaning.md` 신설
+- 81,888건 GPT 10속성 분류 → `news.duckdb::news_classifications` 테이블 신설
+- 분류 비용 추정 휴리스틱 정립 (Batch API 권장 패턴 확립)
+
+### 2026-05-21 — data/ 재구성 + 한국 신문기사 데이터셋 교체
+- data/ 폴더 도메인별 분리 (bills_kr/us/eu, news, analysis, exports)
+- Naver Search API 파이프라인 폐기
+- 6개 매체 KBS/MBC/SBS/YTN/중앙/한겨레, 2018~2026 약 157K 기사 → `news.duckdb`
+
 ### 2026-05-10 — RAG 시스템 구축 (rag_assembly/)
 - LanceDB float16 기반 의미 검색 인프라 (회의록·법안·발언·의원 임베딩)
 - Vertex AI gemini-embedding-001 (8 region multi-region rotation, 1M TPM × 8)
-- ChromaDB 시도 → 1.3M 청크 OOM 후 LanceDB로 전환
-- 뉴스는 미포함 (별도 코퍼스로 유지)
 - duckdb_mcp_server.py에 `rag_search`, `rag_search_bills/speeches/documents`, `rag_stats` 툴 추가
 
 ### 2026-05-10 — 분석 스크립트 폴더 분리
 - root 분산 → `analyze/` (분류·내보내기·subtopic·compare_models)
 - 옛 viz 7개 → `figures/_legacy/` (regenerate_all.py가 정본)
-- `collect_subtopic_expand.py` → `collect/`로 이동 (잘못 root에 있던 것)
 - root 4개 인프라만 유지: config, prompts, bill_loaders, duckdb_mcp_server
 
 ### 2026-05-09 — DB 분리 (raw / analysis)
@@ -396,35 +409,15 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 - 양쪽 동시 access는 ATTACH read-only 패턴
 
 ### 2026-05-08 — 수집 스크립트 collect/ 폴더 분리
-- `download_*.py`, `collect_*.py`, `eu_*.py`, `fetch_bodies.py` 등 → `collect/`
-- 옛 naver v1·v2 → `collect/_legacy/`
-- 옛 일회성 마이그레이션 (Phase 1~5 backfill 등) → 정리 후 git history에 보존
 
-### 2026-04-18 (current) — 프롬프트 통일·법안 필터 재구축 + 어댑터 제거
+### 2026-04-18 — 프롬프트 통일·법안 필터 재구축 + 어댑터 제거
 - 모든 구 버전 v1 프롬프트 폐기, 통일 영문 v2 프롬프트 단일화
 - `prompts.py` 공통 모듈로 분리
 - `analyze/classify_articles.py` (뉴스) / `analyze/classify_bills.py` (법안) 2개 파일로 통합
-- 한국 법안 2단계 GPT 필터를 `analyze/classify_bills.py`에 내장 — 이전 `kr_analysis/kr_01_prepare_data.py` 파이프라인과 기능적 동등
-- `replicate_carvao/` 폴더를 미국 논문 replicate 전용으로 정리 — 한국 관련 스크립트·데이터는 `kr_analysis/` 신설 폴더로 이동
-- 어댑터 제거: `bill_loaders.py` 신설로 `bills_classified_*.json`을 직접 로드. 중간 변환 파일(`*_policy_attr_all.json`)과 `build_legacy_bills.py` 모두 삭제. 소비자(`figures/regenerate_all.py`, `replicate_carvao/gen_{us,eu}_report.py`, `kr_analysis/validate_tfidf_lda.py`)는 모두 `bill_loaders`를 경유
+- 한국 법안 2단계 GPT 필터를 `analyze/classify_bills.py`에 내장
+- 어댑터 제거: `bill_loaders.py` 신설로 `bills_classified_*.json`을 직접 로드
 
-### 2026-04-17 — Naver 수집 방법론 재정립
-- 20개 정책 쿼리 방식 폐기 (쿼리별 기간 편차 심각)
-- 2개 broad 키워드 × 16개 언론사 도메인 쿼리로 전환
-- 네이버 뉴스 페이지 본문 fetch 도입
-- 세부 주제 80 쿼리로 통신사 비중 보완
-
-### 2026-04-15 — 제목 키워드 필터 확정
-- 세 소스 모두 "제목에 AI 키워드 포함" 조건으로 비교 scope 좁힘
-
----
-
-## 11. 알려진 한계와 후속 과제
-
-- **EU 단일 법안 vs 미·한 다법안 비대칭**: EU는 AI Act 단일 체계, 미·한은 개별 법안 다수. 수정안 771건으로 분량 간접 측정 중.
-- **GPT 분류 경계 사례**: 특히 "공익 vs 책임/윤리 AI" 구분에서 5~10% 재라벨링 필요 (보고서 3.3 한계 참조).
-- **한국 도메스틱 뉴스 10속성 분류 미수행**: 2026-05-21 reorg에서 `news.duckdb` 적재까지만 완료. AI 키워드 필터링 + GPT 분류 + figure 통합은 후속 PR로 진행 — `figures/regenerate_all.py`의 fig05(공론화-입법 격차)와 fig06 KR 페어는 그때까지 보류.
-- **매체 다양성**: 한국 6개 매체(KBS/MBC/SBS/YTN/중앙/한겨레)는 방송 4 + 일간지 2 조합. 경제지·IT 전문지·인터넷 매체 부재. 해석 시 명시.
+### 2026-04-15 — 제목 키워드 필터 확정 (영문 뉴스)
 
 ---
 

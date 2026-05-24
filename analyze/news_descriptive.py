@@ -3,6 +3,10 @@
 figures/regenerate_all.py가 import해서 그림을 그릴 수 있도록 public 함수만 제공.
 CLI 모드(`--summary`)는 단순 콘솔 요약 출력.
 
+데이터 클리닝(Strict AI 필터) 정의는 별도 모듈로 분리:
+    from news_cleaning import STRICT_WHERE
+편의를 위해 이 모듈도 STRICT_WHERE를 재export (역호환).
+
 Public functions (모두 @lru_cache, 반복 호출 안전):
     load_monthly_counts()          -> dict[provider, list[(yyyymm, count)]]
     load_provider_year_matrix()    -> (providers, years, matrix np.ndarray)
@@ -73,46 +77,10 @@ def _con() -> duckdb.DuckDBPyConnection:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Strict AI 필터 — boilerplate 제거 + word boundary + 영문 본문 제외
+# Strict AI 필터는 news_cleaning.py에 분리. 역호환을 위해 재export.
+# 신규 코드는 `from news_cleaning import STRICT_WHERE` 권장.
 # ──────────────────────────────────────────────────────────────────────
-# - content에서 MBC boilerplate substring '(AI학습 포함)' / '(AI 학습 포함)'만
-#   정확히 제거 후 매칭.
-#   * 본문 실사용 'AI 학습' (띄어쓰기)·'AI학습' (붙임) 같은 진짜 표현은 보존.
-#   * 본문 사용 분포: 'AI 학습' 띄어쓰기 656건 vs 'AI학습' 붙임 61건 (조사 결과).
-# - 한국어: 인공지능 / 인공 지능 (ILIKE)
-# - 영문: AI / A.I / A.I. (word boundary)
-# - title 또는 cleaned content 어디든 매칭되면 키워드 통과
-# - 추가: 본문이 영문(한글 5% 미만, 200자 이상)인 경우 한국 도메스틱 담론 대상이
-#   아니므로 제외. YTN [K-SCIENCE]·[K-BIZ] 등 외신용 단신 207건 제거.
-#
-# 'artificial intelligence' 풀스펠 키워드는 검증 결과 영문 본문 제외 조항과
-# 완전 중복이라 제거됨 (한국어 본문에 풀스펠만 단독 등장하는 케이스 0건 확인).
-_CLEAN = (
-    "REPLACE(REPLACE(content, '(AI학습 포함)', ''), '(AI 학습 포함)', '')"
-)
-# 영문 본문 판정: 한글 char가 본문의 5% 미만이고 본문이 200자 이상
-_IS_ENGLISH = (
-    "LENGTH(content) > 200 "
-    "AND LENGTH(regexp_replace(content, '[가-힣]', '', 'g'))::FLOAT "
-    "    / LENGTH(content) > 0.95"
-)
-STRICT_WHERE = rf"""
-(
-  (
-   {_CLEAN} ILIKE '%인공지능%' OR title ILIKE '%인공지능%'
-   OR {_CLEAN} ILIKE '%인공 지능%' OR title ILIKE '%인공 지능%'
-   OR regexp_matches({_CLEAN},
-                     '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
-   OR regexp_matches(title,
-                     '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
-   OR regexp_matches({_CLEAN},
-                     '(?i)(^|[^A-Za-z0-9])A\.I\.?([^A-Za-z0-9]|$)')
-   OR regexp_matches(title,
-                     '(?i)(^|[^A-Za-z0-9])A\.I\.?([^A-Za-z0-9]|$)')
-  )
-  AND NOT ({_IS_ENGLISH})
-)
-"""
+from news_cleaning import STRICT_WHERE, CLEANED_CONTENT_SQL  # noqa: E402,F401  (re-exported)
 
 
 @lru_cache(maxsize=1)
@@ -277,19 +245,23 @@ def load_provider_year_matrix() -> tuple[list[str], list[int], np.ndarray]:
 
 @lru_cache(maxsize=1)
 def load_content_length_quartiles() -> dict[str, dict[str, float]]:
-    """매체별 본문 길이 분위수. 반환: {provider: {avg, p05, p25, p50, p75, p95, max}}."""
+    """매체별 본문 길이 분위수 (cleaning 적용 후). 반환: {provider: {avg, p05, p25, p50, p75, p95, max}}.
+
+    cleaning 적용 이유: YTN AI 앵커 footer·MBC boilerplate 등 매체별 잡음이
+    raw content 길이를 부풀려 매체 간 비교를 왜곡함.
+    """
     con = _con()
     try:
-        rows = con.execute("""
+        rows = con.execute(f"""
             SELECT
                 provider,
-                AVG(LENGTH(content))                                AS avg,
-                quantile_cont(LENGTH(content), 0.05)               AS p05,
-                quantile_cont(LENGTH(content), 0.25)               AS p25,
-                quantile_cont(LENGTH(content), 0.50)               AS p50,
-                quantile_cont(LENGTH(content), 0.75)               AS p75,
-                quantile_cont(LENGTH(content), 0.95)               AS p95,
-                MAX(LENGTH(content))                                AS max
+                AVG(LENGTH({CLEANED_CONTENT_SQL}))                                AS avg,
+                quantile_cont(LENGTH({CLEANED_CONTENT_SQL}), 0.05)               AS p05,
+                quantile_cont(LENGTH({CLEANED_CONTENT_SQL}), 0.25)               AS p25,
+                quantile_cont(LENGTH({CLEANED_CONTENT_SQL}), 0.50)               AS p50,
+                quantile_cont(LENGTH({CLEANED_CONTENT_SQL}), 0.75)               AS p75,
+                quantile_cont(LENGTH({CLEANED_CONTENT_SQL}), 0.95)               AS p95,
+                MAX(LENGTH({CLEANED_CONTENT_SQL}))                                AS max
             FROM news_articles
             GROUP BY provider
             ORDER BY provider
@@ -391,19 +363,23 @@ def load_top_categories(limit: int = 30) -> list[tuple[str, int]]:
 
 
 def _build_keyword_case_clause(keyword: str, alias: str) -> str:
-    """단일 키워드에 대한 SUM(CASE WHEN ...) 표현. ASCII 짧은 단어는 word boundary 적용."""
+    """단일 키워드에 대한 SUM(CASE WHEN ...) 표현. ASCII 짧은 단어는 word boundary 적용.
+
+    content는 cleaning 적용 (YTN footer·MBC boilerplate 잡음 제거),
+    title은 raw 그대로 (매체가 title에 boilerplate를 넣은 사례 없음).
+    """
     # 작은따옴표만 SQL 이스케이프 (별다른 메타문자는 LIKE/regexp에서 무난)
     safe = keyword.replace("'", "''")
     is_short_ascii = len(keyword) <= 3 and keyword.isascii() and keyword.isalpha()
     if is_short_ascii or keyword.upper() == "AI":
         patt = re.escape(keyword).replace("'", "''")
         clause = (
-            f"SUM(CASE WHEN regexp_matches(content, '(?i)(^|[^A-Za-z0-9])"
+            f"SUM(CASE WHEN regexp_matches(({CLEANED_CONTENT_SQL}), '(?i)(^|[^A-Za-z0-9])"
             f"{patt}([^A-Za-z0-9]|$)') THEN 1 ELSE 0 END) AS {alias}"
         )
     else:
         clause = (
-            f"SUM(CASE WHEN content ILIKE '%{safe}%' "
+            f"SUM(CASE WHEN ({CLEANED_CONTENT_SQL}) ILIKE '%{safe}%' "
             f"OR title ILIKE '%{safe}%' THEN 1 ELSE 0 END) AS {alias}"
         )
     return clause
@@ -461,28 +437,30 @@ def load_ai_coverage_by_provider() -> dict[str, tuple[int, int]]:
         4. A.I.          (word boundary)
         5. A.I           (word boundary, 단독으로 등장한 경우)
     title 또는 content 어느 한쪽에 있으면 "포함"으로 판정.
+    content는 cleaning 적용 (YTN AI 앵커 footer·MBC boilerplate가 'AI'로 카운트되는 것 차단),
+    title은 raw 그대로.
     """
     con = _con()
     try:
-        rows = con.execute(r"""
+        rows = con.execute(rf"""
             SELECT provider,
                    COUNT(*) AS total,
                    SUM(CASE
                        -- 1) 인공지능
-                       WHEN content ILIKE '%인공지능%'
-                         OR title   ILIKE '%인공지능%'
+                       WHEN ({CLEANED_CONTENT_SQL}) ILIKE '%인공지능%'
+                         OR title ILIKE '%인공지능%'
                        -- 2) 인공 지능
-                         OR content ILIKE '%인공 지능%'
-                         OR title   ILIKE '%인공 지능%'
+                         OR ({CLEANED_CONTENT_SQL}) ILIKE '%인공 지능%'
+                         OR title ILIKE '%인공 지능%'
                        -- 3) AI (word boundary)
-                         OR regexp_matches(content, '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
-                         OR regexp_matches(title,   '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
+                         OR regexp_matches(({CLEANED_CONTENT_SQL}), '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
+                         OR regexp_matches(title, '(?i)(^|[^A-Za-z0-9])AI([^A-Za-z0-9]|$)')
                        -- 4) A.I.
-                         OR regexp_matches(content, '(?i)(^|[^A-Za-z0-9])A\.I\.([^A-Za-z0-9]|$)')
-                         OR regexp_matches(title,   '(?i)(^|[^A-Za-z0-9])A\.I\.([^A-Za-z0-9]|$)')
+                         OR regexp_matches(({CLEANED_CONTENT_SQL}), '(?i)(^|[^A-Za-z0-9])A\.I\.([^A-Za-z0-9]|$)')
+                         OR regexp_matches(title, '(?i)(^|[^A-Za-z0-9])A\.I\.([^A-Za-z0-9]|$)')
                        -- 5) A.I  (마지막 점 없음)
-                         OR regexp_matches(content, '(?i)(^|[^A-Za-z0-9])A\.I([^A-Za-z0-9]|$)')
-                         OR regexp_matches(title,   '(?i)(^|[^A-Za-z0-9])A\.I([^A-Za-z0-9]|$)')
+                         OR regexp_matches(({CLEANED_CONTENT_SQL}), '(?i)(^|[^A-Za-z0-9])A\.I([^A-Za-z0-9]|$)')
+                         OR regexp_matches(title, '(?i)(^|[^A-Za-z0-9])A\.I([^A-Za-z0-9]|$)')
                        THEN 0 ELSE 1 END) AS no_kw
             FROM news_articles
             GROUP BY provider

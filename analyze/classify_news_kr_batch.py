@@ -41,7 +41,7 @@ import _bootstrap  # noqa: F401
 
 import config
 from prompts import SYSTEM_PROMPT
-from news_descriptive import STRICT_WHERE  # type: ignore[import-not-found]
+from news_cleaning import STRICT_WHERE  # type: ignore[import-not-found]
 
 load_dotenv()
 client = OpenAI()
