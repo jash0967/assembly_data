@@ -1,0 +1,19 @@
+# GCP Vertex AI
+google-genai>=0.3.0
+google-cloud-aiplatform>=1.50.0
+
+# Vector DB
+chromadb>=1.5.0
+
+# Korean NLP + BM25
+kiwipiepy>=0.21.0
+rank-bm25>=0.2.2
+
+# Reranker (transformers + torch는 venv에 이미 있음)
+sentence-transformers>=3.0.0
+
+# DuckDB (이미 설치됐을 가능성)
+duckdb>=1.0.0
+
+# Utility
+tqdm>=4.66.0
