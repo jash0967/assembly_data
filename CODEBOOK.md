@@ -1,8 +1,8 @@
 # 국회 Open API 데이터 코드북
 
 > **수집일**: 2026-04-13 (Phase 1~6 통합 마이그레이션 2026-04-18)
-> **수집 스크립트**: `download_all.py`
-> **데이터베이스**: `data/assembly.duckdb` (572 MB)
+> **수집 스크립트**: `collect/download_all.py`
+> **데이터베이스**: `data/bills_kr/assembly_raw.duckdb` (~7.3 GB, 수집·추출) + `data/bills_kr/assembly_analysis.duckdb` (~3 MB, 분류·태깅·집계) + `data/news/news.duckdb` (한국 도메스틱 뉴스 157K). raw/analysis 분리는 2026-05-09부터, news DB는 2026-05-21 추가.
 > **수집 범위**: 제13대 ~ 제22대 국회 (일부 테이블은 전체 대수 포함)
 > **총 레코드**: 약 4,890,000건 (37개 Open API + bill_text 77K + 분류 결과 1.7K)
 >
@@ -866,11 +866,11 @@ vconfsubcconflist (소위원회 회의록)
 
 ## 13. AI 정책 분석 통합 테이블 (Phase 3~5 도입)
 
-이 섹션의 테이블·뷰는 [PLAN_db_consolidation.md](PLAN_db_consolidation.md) 실행으로
+이 섹션의 테이블·뷰는 `PLAN_db_consolidation.md` 실행으로 (계획서는 git history에 보존)
 2026-04-18에 추가된 통합 데이터 레이어입니다. 외부 JSON 파일에서 DB로 이관 완료.
 
 ### `bill_text` — 법안 원문
-[`download_bills.py`](download_bills.py) + [`migrate_bill_text.py`](migrate_bill_text.py)
+[`collect/download_bills.py`](collect/download_bills.py) (옛 seed 스크립트 `migrate_bill_text.py`는 git history에 보관)
 가 채움. PDF는 파일시스템 유지, 텍스트만 DB.
 
 | 컬럼 | 타입 | 설명 |
@@ -886,7 +886,7 @@ vconfsubcconflist (소위원회 회의록)
 행수: 77,104 (age 19=15,426 / 20=21,593 / 21=23,639 / 22=16,446).
 
 ### `bill_classifications` — 10-속성 분류 결과
-[`classify_bills.py`](classify_bills.py) + [`migrate_bill_classifications.py`](migrate_bill_classifications.py).
+[`classify_bills.py`](classify_bills.py) (옛 seed 스크립트 `migrate_bill_classifications.py`는 git history에 보관).
 
 | 컬럼 | 타입 | 설명 |
 |------|------|------|
@@ -933,7 +933,7 @@ KR 법안 분석용 통합 뷰. `v_bill` LEFT JOIN `bill_text` LEFT JOIN
 [`bill_loaders.load_kr_bills`](bill_loaders.py)가 이 뷰를 사용.
 
 ### `document_text` — PDF/HWP 추출 결과 통합 (2026-04-19)
-[`download_documents.py`](download_documents.py) + [`migrate_legacy_docs.py`](migrate_legacy_docs.py).
+[`collect/download_documents.py`](collect/download_documents.py) (옛 seed 스크립트 `migrate_legacy_docs.py`는 git history에 보관).
 6개 API 테이블의 첨부 PDF·HWP를 받아 fitz/hwp5txt로 텍스트화.
 
 | 컬럼 | 타입 | 설명 |
@@ -947,7 +947,7 @@ KR 법안 분석용 통합 뷰. `v_bill` LEFT JOIN `bill_text` LEFT JOIN
 | `doc_date` | VARCHAR | 회의일 / 보고서 연도 |
 | `url` | VARCHAR | 원본 다운로드 URL |
 | `file_format` | VARCHAR | `pdf` / `hwp` / `hwpx` / `unknown` (매직 바이트 감지) |
-| `file_path` | VARCHAR | 로컬 raw 파일 경로 (`data/docs/{source}/`) |
+| `file_path` | VARCHAR | 로컬 raw 파일 경로 (`data/bills_kr/docs/{source}/`) |
 | `full_text` | TEXT | 추출된 전체 텍스트 |
 | `text_length` | INTEGER | 문자 수 |
 | `status` | VARCHAR | `extracted_ok` / `url_error` / `url_404` / `format_unsupported` / `extract_failed` / `no_url` |
@@ -971,7 +971,7 @@ KR 법안 분석용 통합 뷰. `v_bill` LEFT JOIN `bill_text` LEFT JOIN
 
 url_error 11건은 모두 `record.assembly.go.kr` 서버가 119바이트 placeholder를 반환하는 비가용 ID (실제 회의록 없음).
 
-원본 raw 파일(~25GB PDF)은 `data/docs/{source}/`에 유지 (gitignore). 파일 포맷은 매직 바이트로 감지하며, 이번 실행에서는 전부 PDF — HWP 샘플 확보되면 `hwp5txt` CLI 자동 디스패치.
+원본 raw 파일(~25GB PDF)은 `data/bills_kr/docs/{source}/`에 유지 (gitignore). 파일 포맷은 매직 바이트로 감지하며, 이번 실행에서는 전부 PDF — HWP 샘플 확보되면 `hwp5txt` CLI 자동 디스패치.
 
 `research` 소스의 `nfvmtaqoaldzhobsw` (소규모 연구용역)는 URL 컬럼이 없고 `FILE_ID`만 존재. 국회 포털 B0000108 상세 페이지가 첨부를 노출하지 않아 URL 도출 불가. 레거시 `data/txt/*/research/` 의 295건만 seed로 보존 (가능해지면 추후 확장).
 
@@ -982,7 +982,7 @@ url_error 11건은 모두 `record.assembly.go.kr` 서버가 119바이트 placeho
 [`config.py`](config.py)의 ApiSpec 선언과 동일. `age_behavior`별로 정렬.
 
 `age` 컬럼은 모든 per_age/by_date/by_bill_id 테이블에 INTEGER로 존재하며
-NULL이 없음 (Phase 6 [`validate_collection.py`](validate_collection.py)가 보장).
+NULL이 없음 (Phase 6 [`collect/validate_collection.py`](collect/validate_collection.py)가 보장).
 `current_only` 테이블은 모두 `age = 22` 단일값.
 
 ### per_age (23 테이블)
@@ -1047,3 +1047,50 @@ NULL이 없음 (Phase 6 [`validate_collection.py`](validate_collection.py)가 �
 | `국가재건최고회의` | -2 | 1961-1963 |
 | `비상국무회의` | -1 | 1972-1973 |
 | `제헌` | 1 | 1948 (제헌국회를 1대로 매핑) |
+
+---
+
+## 14. 한국 도메스틱 뉴스 (`data/news/news.duckdb`)
+
+2026-05-21에 도입. Open API와 무관한 별도 DB. 외부 라이선스로 입수한 6개 매체 정식 아카이브.
+
+### news_articles
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `news_id` | TEXT (PK) | 매체별 유니크 ID (예: `08100101.20180101105910001`). 매체 prefix + 타임스탬프 인코딩 |
+| `title` | TEXT | 기사 제목 (plain text) |
+| `content` | TEXT | 기사 본문 전문 (plain text, `\n` 포함) |
+| `dateline` | TIMESTAMP WITH TIME ZONE | 송고 시각 |
+| `published_at` | TIMESTAMP WITH TIME ZONE | 발행 시각 (date만 의미 있고 time은 0) |
+| `enveloped_at` | TIMESTAMP WITH TIME ZONE | 봉투(전달) 시각 |
+| `provider` | TEXT | `KBS` / `MBC` / `SBS` / `YTN` / `중앙일보` / `한겨레` |
+| `byline` | TEXT | 기자명 / 이메일 |
+| `provider_link_page` | TEXT | 원문 URL |
+| `category` | JSON | 카테고리 태그 배열 (예: `["경제>산업_기업", "경제>반도체"]`) |
+| `category_incident` | JSON | 사건 카테고리 (대부분 `[]`) |
+| `hilight` | TEXT | 검색 강조 스니펫 (`<b>...</b>` 포함) |
+| `printing_page` | TEXT | 지면 정보 (대부분 빈 문자열) |
+| `ingested_at` | TIMESTAMP | 적재 시각 (자동) |
+
+인덱스: `provider`, `published_at`, `(provider, published_at)`.
+
+### 매체·연도 분포 (2026-05-21 적재 기준)
+| provider | rows |
+|----------|------|
+| 중앙일보 | 48,019 |
+| YTN | 37,260 |
+| MBC | 33,144 |
+| 한겨레 | 18,713 |
+| KBS | 17,659 |
+| SBS | 3,091 |
+| **총합** | **157,886** |
+
+기간: 2018-01-01 ~ 2026-03-31 (`published_at` 기준).
+
+### 적재 스크립트
+[collect/build_news_db.py](collect/build_news_db.py) — `data/news/raw_news_archive/{provider}/{year}/{month}/{day}/*.json` walk → batch insert. `INSERT OR IGNORE` 로 idempotent.
+
+원본 JSON은 `data/news/raw_news_archive/` (gitignored, ~665 MB) 그대로 보존 — 향후 스키마 변경 시 재적재 가능.
+
+### AI 키워드 필터링·10속성 분류
+이번 reorg에서는 미수행. 후속 작업으로 `analyze/`에 별도 스크립트 추가 예정.

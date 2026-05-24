@@ -7,8 +7,27 @@ load_dotenv()
 ASSEMBLY_API_KEY = os.environ.get("ASSEMBLY_API_KEY", "")
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 PAGE_SIZE = 1000
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "assembly.duckdb")
-PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "data", "assembly_progress.json")
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+# Domain-organized data subdirectories (2026-05 reorg).
+# File-move and path-flip happens in Phase 3-4 of the reorg PR; these
+# constants are intentionally added ahead of time so new code can target them.
+BILLS_KR_DIR = os.path.join(_DATA_DIR, "bills_kr")   # KR Open API: bills + docs + speeches
+BILLS_US_DIR = os.path.join(_DATA_DIR, "bills_us")   # US Congress 118/119
+BILLS_EU_DIR = os.path.join(_DATA_DIR, "bills_eu")   # EU AI Act + amendments
+NEWS_DIR     = os.path.join(_DATA_DIR, "news")       # KR/NYT/Guardian news
+ANALYSIS_DIR = os.path.join(_DATA_DIR, "analysis")   # JSON outputs (classifications, topics)
+EXPORTS_DIR  = os.path.join(_DATA_DIR, "exports")    # Human-readable markdown
+
+# DB paths
+RAW_DB_PATH      = os.path.join(BILLS_KR_DIR, "assembly_raw.duckdb")
+ANALYSIS_DB_PATH = os.path.join(BILLS_KR_DIR, "assembly_analysis.duckdb")
+NEWS_DB_PATH     = os.path.join(NEWS_DIR,     "news.duckdb")
+# Deprecated alias: legacy code paths still importing config.DB_PATH default to
+# the analysis DB (which ATTACHes raw read-only). New code should pick
+# RAW_DB_PATH or ANALYSIS_DB_PATH explicitly.
+DB_PATH = ANALYSIS_DB_PATH
+PROGRESS_FILE = os.path.join(BILLS_KR_DIR, "assembly_progress.json")
 
 MAX_AGE = 22  # 현재 22대 국회
 

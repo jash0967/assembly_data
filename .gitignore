@@ -33,5 +33,12 @@ ethics/
 treemap*.html
 subtopics_report.html
 
+# Treemap v2 prototype (UI 실험 중 — 정리 후 정본 위치 결정)
+treemap_v2/
+
+# 분석 과정 중 발생하는 보고용·일회성·외부 발송용 파일 (정본 아닌 것)
+# 정본 분석 산출물은 data/exports/ 또는 data/analysis/, 시스템 임시는 C:\claude_scratch\
+working/
+
 # Downloaded raw documents (PDF/HWP/HWPX)
 data/docs/

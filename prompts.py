@@ -3,7 +3,7 @@
 Based on Carvão et al. (2025) "Governance at a Crossroads: Artificial Intelligence
 and the Future of Innovation in America" (Harvard Kennedy School, M-RCBG Working Paper).
 
-Used by classify.py (news: Guardian, NYT, Naver) and classify_bills.py (bills: KR, US, EU).
+Used by classify_articles.py (news: Guardian, NYT) and classify_bills.py (bills: KR, US, EU).
 Text may be in English or Korean; GPT handles both.
 Output labels are unified English for cross-source comparability.
 """
@@ -27,6 +27,8 @@ The text may be a news article (Guardian/NYT/Korean dailies) or a legislative bi
 
 ## 10 Policy Attributes
 
+The descriptive examples for each attribute are illustrative, not exhaustive. Do not let them limit your classification if the article's content clearly fits the attribute's core definition. Focus on the article's main policy angle and framing rather than specific keywords.
+
 1. **Industrial policy** — Ex-ante government action to cultivate the AI industry.
    - Public R&D funding (NSF, DoE, NIST; Korean: 과기정통부, 산업부)
    - Workforce development, AI talent pipelines, training programs
@@ -39,7 +41,6 @@ The text may be a news article (Guardian/NYT/Korean dailies) or a legislative bi
    - Antitrust cases (FTC v Google/Amazon/Apple/Meta; EU DMA; Korean: 공정거래위원회)
    - M&A review, killer acquisitions, self-preferencing
    - Market-share battles between frontier labs (OpenAI, Anthropic, Google, Meta, xAI, Naver, Kakao, Samsung)
-   - AI bubble/valuation discussions, stock-market impacts driven by competition
    - Platform gatekeeper regulation
    - Keywords: antitrust, monopoly, acquisition, market share, 독점, 반독점, 공정거래, 시장지배력
 
@@ -104,7 +105,7 @@ The text may be a news article (Guardian/NYT/Korean dailies) or a legislative bi
 
 ## Disambiguation Rules
 
-- **Industrial policy vs Market efficiency**: If the government is *spending/funding/promoting* (ex-ante) → Industrial policy. If the government is *regulating/restricting/breaking up* firms, or the article frames inter-firm competition/market-share/bubble dynamics → Market efficiency. When both apply, pick based on the article's dominant frame.
+- **Industrial policy vs Market efficiency**: If the government is *spending/funding/promoting* (ex-ante) → Industrial policy. If the government is *regulating/restricting/breaking up* firms, or the article frames inter-firm competition/market-share → Market efficiency. When both apply, pick based on the article's dominant frame.
 - **Safety vs Responsible/ethical AI**: Technical reliability (hallucination, alignment, testing) → Safety. Normative/value-based concerns (bias, fairness, transparency as principles) → Responsible/ethical AI.
 - **Public interest vs Labor**: Consumers/citizens in general → Public interest. Workers/employment specifically → Labor.
 - **Deepfakes**: Electoral context → Elections. Other contexts (harassment, impersonation, celebrity) → Responsible/ethical AI.

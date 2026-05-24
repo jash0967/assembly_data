@@ -24,7 +24,6 @@ import duckdb
 import config
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(ROOT, "data")
 REP_DIR = os.path.join(ROOT, "replicate_carvao", "data")
 
 
@@ -36,7 +35,13 @@ def _read_json(path: str):
 
 
 def _connect_ro() -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(config.DB_PATH, read_only=True)
+    """Open analysis DB read-only and ATTACH raw read-only.
+
+    All v_kr_bills_analysis-style cross-DB views resolve via this connection.
+    """
+    con = duckdb.connect(config.ANALYSIS_DB_PATH, read_only=True)
+    con.execute(f"ATTACH '{config.RAW_DB_PATH}' AS raw (READ_ONLY)")
+    return con
 
 
 # =============================================================================
@@ -172,11 +177,11 @@ def load_eu_bills(include: Iterable[str] = ("act", "amendments"),
     amend_meta: dict[str, dict] = {}
     if enrich:
         if "act" in include:
-            data = _read_json(os.path.join(DATA_DIR, "eu_ai_act_articles.json"))
+            data = _read_json(os.path.join(config.BILLS_EU_DIR, "eu_ai_act_articles.json"))
             if data:
                 article_meta = {str(a.get("article_num", "")): a for a in data}
         if "amendments" in include:
-            data = _read_json(os.path.join(DATA_DIR, "eu_amendments.json"))
+            data = _read_json(os.path.join(config.BILLS_EU_DIR, "eu_amendments.json"))
             if data:
                 amend_meta = {str(a.get("amendment_num", "")): a for a in data}
 
