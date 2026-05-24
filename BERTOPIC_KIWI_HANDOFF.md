@@ -246,6 +246,6 @@ venv\Scripts\python.exe analyze\subtopic_bertopic.py --attr "책임/윤리AI" --
 
 ## 본 handoff 파일 위치
 
-`C:\claude_scratch\20260525_bertopic_kiwi_handoff.md`
+`BERTOPIC_KIWI_HANDOFF.md` (repo root). 2026-05-25 commit `9b8d369`에서 `C:\claude_scratch\`에서 이동.
 
-진행 중인 분석은 위 경로 참조. 코드 변경은 [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py)에 누적되어 있고 git working tree에 untracked/modified 상태.
+코드 변경은 [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py)에 commit `582df98`로 누적되어 있음. 진단용 임시 변경(`device='cuda'`, `show_progress_bar=True`, 임베딩 시작/완료 print)도 포함.
