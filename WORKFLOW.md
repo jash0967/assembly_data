@@ -3,7 +3,20 @@
 > 이 문서는 본 프로젝트의 모든 데이터 흐름, 필터 기준, 분류 방법, 산출물을 단일 참고자료로 기록.
 > 보고서 [report_expanded_draft.md](report_expanded_draft.md)와 함께 본 파이프라인이 정본.
 
-> **2026-05-22 (current) — 한국 도메스틱 뉴스 Strict 필터 + 10속성 분류 완료**
+> **2026-05-25 (current) — WSL 이주 + BERTopic 파이프라인 GPU 가속·매핑 영속화**
+>
+> 1. **환경**: Windows → WSL2 Linux 이주, `.venv` 전체 재설치 (cuml-cu13, pytest 등 추가) — [requirements.txt](requirements.txt)
+> 2. **subtopic_bertopic.py 리팩터** ([analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py)):
+>    - `--backend {auto,cuml,cpu}` CLI 옵션 — cuML 사용 시 UMAP+HDBSCAN GPU 가속 (KO 36k 클러스터링 5분 → 10초)
+>    - Kiwi 병렬 토큰화 (`pretokenize_ko_texts`, `num_workers=8`) + 사용자 사전 19개 (KIWI_USER_WORDS) — 조사 결합형 제거
+>    - KO 분기 `ngram_range=(1,2)`로 명사 bigram 추출 (`딥페이크 성범죄`, `자율주행 차량` 등)
+>    - `'AI'`/`'A.I'` stop_words 추가 — 단순 prefix bigram noise 차단
+>    - 임베딩 캐시 `data/analysis/bertopic_embeddings/*.npy` — 재실행 시 hit
+>    - article→topic 매핑 → `assembly_analysis.duckdb::subtopic_assignments` 테이블 INSERT (run_timestamp로 버전 구분)
+>    - lazy OpenAI client (`OPENAI_API_KEY` 없어도 `--no-label`로 실행 가능)
+> 3. **신규 시각화**: [figures/temporal_top10.py](figures/temporal_top10.py) — 분기별 소주제 Top-10 랭킹 변동 (Plotly bump chart) + Lifespan Gantt (matplotlib)
+>
+> **2026-05-22 — 한국 도메스틱 뉴스 Strict 필터 + 10속성 분류 완료**
 >
 > 1. **Strict AI 필터 신설** ([analyze/news_cleaning.py](analyze/news_cleaning.py)):
 >    - 공급사 substring 매칭 누수 + 매체별 boilerplate footer 정제 (4규칙)
@@ -237,7 +250,8 @@ Carvão Appendix II 기준 정본:
 | `figures/_legacy/generate_timeline*.py` | 옛 시계열 그림 (regenerate_all로 통합됨) |
 | `figures/_legacy/generate_figures.py` | 옛 보고서 그림 (regenerate_all로 통합됨) |
 | `figures/_legacy/build_treemap_*.py` | 옛 트리맵 데이터 |
-| [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 (EN/KO cross-lingual 정렬) |
+| [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 — EN/KO cross-lingual 정렬, Kiwi 명사 토큰화, cuML GPU 백엔드 (`--backend cuml`), 매핑 → `subtopic_assignments` |
+| [figures/temporal_top10.py](figures/temporal_top10.py) | 분기별 소주제 Top-10 랭킹 변동 — Bump chart(Plotly) + Lifespan Gantt(matplotlib) |
 | [analyze/subtopic_discover.py](analyze/subtopic_discover.py) | LLM 직접 소주제 도출 (5 seed) |
 | [analyze/subtopic_finalize.py](analyze/subtopic_finalize.py) | 5 seed 결과 LLM 통합 |
 | [analyze/subtopic_overlap.py](analyze/subtopic_overlap.py) | seed 간 overlap rate (안정성 측정) |
@@ -315,6 +329,16 @@ python analyze/export_bills.py all                          # 법안 속성별 (
 
 # 8. 시각화 (정본)
 python figures/regenerate_all.py                            # fig01~fig09 일괄 + figures_data.xlsx
+
+# 9. BERTopic 소주제 추출 + 시계열 시각화 (분기별 Top-10 동적 랭킹)
+python analyze/subtopic_bertopic.py --backend cuml --no-label
+# → data/analysis/subtopics_bertopic.json (토픽 키워드)
+# → assembly_analysis.duckdb::subtopic_assignments (article→topic 매핑)
+# CPU만 가능하면 --backend cpu (KO 36k 기준 ~5분 → ~1시간으로 늘어남)
+
+python figures/temporal_top10.py
+# → figures/out/temporal_top10_bump.html (인터랙티브)
+# → figures/out/temporal_top10_lifespan.png
 ```
 
 ### 재실행 (캐시 활용)
@@ -327,9 +351,19 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 
 ## 8. 주요 출력 파일 체크리스트
 
-### 데이터베이스 (정본)
+### 폴더 정책 (2026-05-27 정리)
+
+| 폴더 | 용도 | git |
+|---|---|---|
+| `data/` | **정본 원본** (수집 JSON, DuckDB, PDF 아카이브) | gitignored |
+| `output/` | **파이프라인 산출물** (분류 결과·subtopic·exports·figures·stability) | gitignored |
+| `.cache/` | **재생성 가능한 캐시** (BERTopic SBERT 임베딩 등) — 숨김 폴더 | gitignored |
+
+config 상수 (`config.py`): `ANALYSIS_DIR`, `EXPORTS_DIR`, `STABILITY_DIR`, `FIGURES_OUT_DIR` 모두 `output/` 하위. `BERTOPIC_EMBED_CACHE` 만 `.cache/` 하위. **하드코드 path 금지** — 항상 config 상수 사용.
+
+### 데이터베이스 (정본, data/)
 - [ ] `data/bills_kr/assembly_raw.duckdb` — 37 API + bill_text + document_text + speeches
-- [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + 분석 뷰
+- [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + **`subtopic_assignments`** (BERTopic article→topic 매핑, run_timestamp별) + 분석 뷰
 - [ ] `data/bills_us/congress.duckdb` — US 118·119 Congress API 수집물
 - [ ] `data/news/news.duckdb` — `news_articles` + **`news_classifications`** + `news_prompt_versions`
 
@@ -342,16 +376,24 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 - [ ] `replicate_carvao/data/bills_processed.json` (US 118)
 - [ ] `replicate_carvao/data/us119_bills_processed.json` (US 119)
 
-### 10속성 분류 결과
-- [ ] `data/analysis/articles_classified_guardian.json` — 영문 뉴스
-- [ ] `data/analysis/articles_classified_nyt.json`
+### 10속성 분류 결과 (output/analysis/)
+- [ ] `output/analysis/articles_classified_guardian.json` — 영문 뉴스
+- [ ] `output/analysis/articles_classified_nyt.json`
 - [ ] **DB**: `news.duckdb::news_classifications` — 한국 도메스틱 뉴스
 - [ ] **DB**: `assembly_analysis.bill_classifications` — 법안 6소스
 
-### 사람 열람용 마크다운
-- [ ] `data/exports/titles_{guardian,nyt}_by_category.md`
-- [ ] `data/exports/bills_kr_{19,20,21,22}_by_category.md`
-- [ ] `data/exports/bills_kr_all_by_category.md`
+### 사람 열람용 마크다운 (output/exports/)
+- [ ] `output/exports/titles_{guardian,nyt}_by_category.md`
+- [ ] `output/exports/bills_kr_{19,20,21,22}_by_category.md`
+- [ ] `output/exports/bills_kr_all_by_category.md`
+
+### BERTopic 산출물
+- [ ] `output/analysis/subtopics_bertopic.json` — 토픽 라벨·키워드·통계 (10개 attr × ~30 토픽)
+- [ ] `.cache/bertopic_embeddings/{attr}_{lang}_{hash}.npy` — BGE-M3 임베딩 캐시 (gitignored)
+- [ ] `output/stability/{attr}_runs.npy`, `_cocluster.npy`, `_consistency_*.json` — 안정성 실험 매트릭스 (working/ 시험 스크립트 출력)
+- [ ] `assembly_analysis.duckdb::subtopic_assignments` — article→topic 매핑 (run_timestamp별 누적)
+- [ ] `output/figures/temporal_top10_bump.html` — 분기별 Top-10 랭킹 변동 인터랙티브 차트
+- [ ] `output/figures/temporal_top10_lifespan.png` — 토픽별 Top-10 머문 기간 Gantt
 
 ### 보고서
 - [ ] `report_expanded_draft.md` — 최신 정본 보고서
@@ -380,6 +422,22 @@ python figures/regenerate_all.py                            # fig01~fig09 일괄
 ---
 
 ## 10. 작업 이력 주요 분기
+
+### 2026-05-27 — 폴더 정책 정리: data / output / cache 분리
+- `data/` 는 정본 원본·DB 만 (bills_kr/us/eu, news, _archive, _audit)
+- 새 `output/` 폴더 — 파이프라인 산출물 (analysis JSON, exports markdown, figures, stability 매트릭스)
+- 새 `.cache/` 폴더 (숨김) — 재생성 가능한 캐시 (bertopic_embeddings/), `.gitignore` 등재
+- config.py 경로 상수 갱신: `ANALYSIS_DIR/EXPORTS_DIR/STABILITY_DIR/FIGURES_OUT_DIR` → `output/`, `BERTOPIC_EMBED_CACHE` → `.cache/`
+- 모든 스크립트(analyze/, figures/, working/)에서 hardcode path 제거, config 상수 사용
+- 시험적·일회성 분석 스크립트는 `working/` 폴더 안에 작성·실행 ([feedback_test_scripts_location](.claude/projects/-home-jays0967-assembly-data/memory/feedback_test_scripts_location.md) 메모리 참조)
+
+### 2026-05-25 — WSL 이주 + BERTopic 파이프라인 GPU·매핑 영속화
+- Windows → WSL2 Linux 환경 이주, `.venv` 전체 재구축 ([requirements.txt](requirements.txt))
+- cuml-cu13(RAPIDS) GPU UMAP+HDBSCAN 도입 — KO 36k 클러스터링 5분 → 10초 (~30배)
+- `subtopic_bertopic.py` 리팩터: `--backend {auto,cuml,cpu}` CLI, Kiwi 병렬(`num_workers=8`) + `pretokenize_ko_texts` 정상화 (이전 결과 1,615건 조사 결합형 → 0건), KO `ngram_range=(1,2)`, `'AI'` stopword, 임베딩 캐시(`data/analysis/bertopic_embeddings/`), lazy OpenAI 클라이언트
+- 신규 테이블 `assembly_analysis.duckdb::subtopic_assignments` — article→topic 매핑 (run_timestamp 버전 구분)
+- 신규 시각화 [figures/temporal_top10.py](figures/temporal_top10.py) — 분기별 Top-10 Bump chart + Lifespan Gantt
+- 진단 자료: [BERTOPIC_KIWI_HANDOFF.md](BERTOPIC_KIWI_HANDOFF.md) (Windows hang 진단 기록 — WSL에서 해결됨)
 
 ### 2026-05-22 — 한국 도메스틱 뉴스 Strict 필터 + 10속성 분류
 - 공급사 substring 매칭 누수·매체별 boilerplate footer 정제 위한 Strict 필터 4규칙 설계

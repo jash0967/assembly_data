@@ -1,0 +1,55 @@
+# assembly_data — full venv requirements (Python ≥3.10)
+# Generated from import scan of analyze/, collect/, figures/, rag_assembly/,
+# replicate_carvao/, kr_analysis/, and root-level scripts.
+
+# ── Core collector (pyproject.toml) ───────────────────────────────────────────
+requests>=2.31
+duckdb>=1.0
+python-dotenv>=1.0
+
+# ── Data / DB ────────────────────────────────────────────────────────────────
+pyarrow>=15.0
+numpy>=1.26,<2.3
+
+# ── PDF / HWP / HWPX extraction ──────────────────────────────────────────────
+PyMuPDF>=1.24            # `import fitz`
+pyhwp>=0.1b15            # hwp5txt for legacy HWP
+beautifulsoup4>=4.12     # `from bs4 import BeautifulSoup`
+lxml>=5.0                # bs4/xml parser backend
+
+# ── LLM clients ──────────────────────────────────────────────────────────────
+openai>=1.40
+google-genai>=0.3.0
+google-cloud-aiplatform>=1.50.0
+google-auth>=2.30
+
+# ── MCP server ───────────────────────────────────────────────────────────────
+mcp>=1.0                 # `from mcp.server.fastmcp import FastMCP`
+
+# ── Classical NLP / ML ───────────────────────────────────────────────────────
+scikit-learn>=1.4        # TF-IDF, LDA, cosine_similarity, CountVectorizer
+matplotlib>=3.8
+
+# ── Topic modeling stack (BERTopic) ──────────────────────────────────────────
+bertopic>=0.16
+umap-learn>=0.5          # `from umap import UMAP`
+hdbscan>=0.8.33
+
+# Optional GPU clustering backend for analyze/subtopic_bertopic.py.
+# Requires NVIDIA's package index when installing from scratch:
+#   pip install --extra-index-url https://pypi.nvidia.com -r requirements.txt
+cuml-cu13>=26.4.0
+
+# ── Korean NLP + BM25 ────────────────────────────────────────────────────────
+kiwipiepy>=0.21.0
+rank-bm25>=0.2.2
+bm25s>=0.2.0
+
+# ── RAG (rag_assembly/) ──────────────────────────────────────────────────────
+chromadb>=1.5.0
+lancedb>=0.13
+sentence-transformers>=3.0.0   # pulls torch + transformers
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+tqdm>=4.66.0
+pytest>=8.0              # avoids a CuPy/torch introspection import-order edge case

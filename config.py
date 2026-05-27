@@ -7,17 +7,26 @@ load_dotenv()
 ASSEMBLY_API_KEY = os.environ.get("ASSEMBLY_API_KEY", "")
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 PAGE_SIZE = 1000
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+_ROOT       = os.path.dirname(__file__)
+_DATA_DIR   = os.path.join(_ROOT, "data")     # 정본 원본·DB만
+_OUTPUT_DIR = os.path.join(_ROOT, "output")   # 파이프라인 산출물
+_CACHE_DIR  = os.path.join(_ROOT, ".cache")    # 재생성 가능한 캐시, gitignored
 
-# Domain-organized data subdirectories (2026-05 reorg).
-# File-move and path-flip happens in Phase 3-4 of the reorg PR; these
-# constants are intentionally added ahead of time so new code can target them.
+# 정본 데이터 (수집 원본 + DuckDB)
 BILLS_KR_DIR = os.path.join(_DATA_DIR, "bills_kr")   # KR Open API: bills + docs + speeches
 BILLS_US_DIR = os.path.join(_DATA_DIR, "bills_us")   # US Congress 118/119
 BILLS_EU_DIR = os.path.join(_DATA_DIR, "bills_eu")   # EU AI Act + amendments
 NEWS_DIR     = os.path.join(_DATA_DIR, "news")       # KR/NYT/Guardian news
-ANALYSIS_DIR = os.path.join(_DATA_DIR, "analysis")   # JSON outputs (classifications, topics)
-EXPORTS_DIR  = os.path.join(_DATA_DIR, "exports")    # Human-readable markdown
+
+# 파이프라인 산출물 (output/)
+ANALYSIS_DIR    = os.path.join(_OUTPUT_DIR, "analysis")    # JSON outputs (classifications, topics)
+EXPORTS_DIR     = os.path.join(_OUTPUT_DIR, "exports")     # Human-readable markdown
+STABILITY_DIR   = os.path.join(_OUTPUT_DIR, "stability")   # BERTopic 안정성 실험 (npy + JSON)
+FIGURES_OUT_DIR = os.path.join(_OUTPUT_DIR, "figures")     # plotly/matplotlib 시각화 산출
+
+# 캐시 (재생성 가능, .gitignore에 등재)
+CACHE_DIR              = _CACHE_DIR
+BERTOPIC_EMBED_CACHE   = os.path.join(_CACHE_DIR, "bertopic_embeddings")
 
 # DB paths
 RAW_DB_PATH      = os.path.join(BILLS_KR_DIR, "assembly_raw.duckdb")

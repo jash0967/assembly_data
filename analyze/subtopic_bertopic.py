@@ -7,12 +7,14 @@ Usage:
     python subtopic_bertopic.py --attr 책임/윤리AI
     python subtopic_bertopic.py
 """
-import json, os, sys, time, html as html_mod, re, argparse
+import json, os, sys, time, html as html_mod, re, argparse, hashlib
 from collections import Counter
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-assembly-data")
 
 import duckdb
 import numpy as np
@@ -38,7 +40,8 @@ KR_BODY_CHAR_CAP  = 1500
 
 
 # ─── Kiwi 토크나이저 (KO 명사 추출, 조사 결합형 해소) ───
-_kiwi = Kiwi()
+KIWI_WORKERS = min(8, os.cpu_count() or 1)
+_kiwi = Kiwi(num_workers=KIWI_WORKERS)
 # 데이터 기반: Kiwi 기본 사전이 분리하는 핵심 어휘만 등록
 KIWI_USER_WORDS = [
     # AI 핵심어
@@ -58,9 +61,9 @@ for _w in KIWI_USER_WORDS:
 KO_NOUN_TAGS = {"NNG", "NNP", "SL"}   # 일반명사·고유명사·외래어
 _PUNCT_TAIL = re.compile(r"[^A-Za-z가-힣\d]+$")
 
-def ko_tokenizer(text):
+def _ko_forms(tokens):
     out = []
-    for t in _kiwi.tokenize(text):
+    for t in tokens:
         if t.tag not in KO_NOUN_TAGS:
             continue
         form = _PUNCT_TAIL.sub("", t.form)
@@ -68,8 +71,24 @@ def ko_tokenizer(text):
             out.append(form)
     return out
 
+
+def ko_tokenizer(text):
+    return _ko_forms(_kiwi.tokenize(text))
+
+
+def pretokenize_ko_texts(texts):
+    return [" ".join(_ko_forms(tokens)) for tokens in _kiwi.tokenize(texts)]
+
 OUTPUT   = os.path.join(config.ANALYSIS_DIR, "subtopics_bertopic.json")
-client   = OpenAI()
+EMBED_CACHE_DIR = config.BERTOPIC_EMBED_CACHE
+os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+
+_client = None
+def _get_client():
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 ATTRS_KR = ['AI안전','책임/윤리AI','산업정책','공익/소비자보호','국가안보',
             '선거/민주주의','시장경쟁/독과점','노동/고용','저작권/지식재산','국제협력']
@@ -85,8 +104,12 @@ SBERT_MODEL     = "BAAI/bge-m3"   # 다국어 임베딩 (1024-dim, XLM-R-large �
 SBERT_BATCH     = 16              # BGE-M3는 VRAM 더 씀 (MiniLM 64 → 16)
 MERGE_THRESHOLD = 0.68            # BGE-M3는 sim 분포가 더 높게 깔려 0.62 → 0.68 재캘리브
 
+CLUSTER_BACKEND = "cpu"
+DETERMINISTIC_CLUSTERING = False
+USE_KEYBERT_REPRESENTATION = True
+
 BASE_STOPWORDS = [
-    'ai','artificial','intelligence','the','and','for','that','with',
+    'ai','AI','A.I','A.I.','Ai','artificial','intelligence','the','and','for','that','with',
     'has','have','are','was','were','will','its','but','not','from',
     'this','can','new','more','also','been','could','would','about',
     'says','said','use','used','using','make','like','just',
@@ -235,15 +258,17 @@ def load_news():
             attr = a.get("primary","")
             if normalize: attr = NORMALIZE.get(attr,attr)
             if attr not in ATTRS_KR: continue
-            text = text_map.get(a.get("article_id",""),"")
+            aid = a.get("article_id","")
+            text = text_map.get(aid,"")
             if len(text) > 20:
-                articles.append({"text":text,"source":source,"attr":attr,"lang":lang})
+                articles.append({"id":f"{source}:{aid}","text":text,"source":source,"attr":attr,"lang":lang})
 
     # ── KR domestic news (news.duckdb) ──
     con = duckdb.connect(config.NEWS_DB_PATH, read_only=True)
     con.execute("PRAGMA disable_progress_bar")
     kr_sql = f"""
-      SELECT n.title,
+      SELECT n.news_id,
+             n.title,
              SUBSTR(({CLEANED_CONTENT_SQL}), 1, {KR_BODY_CHAR_CAP}) AS body,
              n.provider,
              c.primary_attr
@@ -260,7 +285,7 @@ def load_news():
     con.close()
     n_kr_loaded = 0
     n_kr_skipped_label = 0
-    for title, body, provider, primary in kr_rows:
+    for news_id, title, body, provider, primary in kr_rows:
         attr = NORMALIZE.get(primary)
         if attr not in ATTRS_KR:
             n_kr_skipped_label += 1
@@ -268,6 +293,7 @@ def load_news():
         text = clean_text(f"{title or ''}. {body or ''}")
         if len(text) > 20:
             articles.append({
+                "id":     f"kr:{news_id}",
                 "text":   text,
                 "source": provider,
                 "attr":   attr,
@@ -283,48 +309,130 @@ def load_news():
 # ──────────────────────────────────────────────
 # 단일 언어 BERTopic 실행 → 임베딩 포함 반환
 # ──────────────────────────────────────────────
-def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
+def make_cluster_models(n_neigh, n_comp, mcs):
+    if CLUSTER_BACKEND == "cuml":
+        from cuml.manifold import UMAP as cuUMAP
+        from cuml.cluster import HDBSCAN as cuHDBSCAN
+
+        # cuML UMAP with a fixed random_state can force serial epochs. Leave it
+        # unset for the fast GPU path unless explicitly requested.
+        random_state = 42 if DETERMINISTIC_CLUSTERING else None
+        umap_model = cuUMAP(
+            n_neighbors=n_neigh,
+            n_components=n_comp,
+            min_dist=0.0,
+            metric="cosine",
+            random_state=random_state,
+            output_type="numpy",
+        )
+        hdbscan_model = cuHDBSCAN(
+            min_cluster_size=mcs,
+            min_samples=1,
+            metric="euclidean",
+            prediction_data=True,
+            cluster_selection_method="leaf",
+            output_type="numpy",
+        )
+        return umap_model, hdbscan_model
+
+    umap_model = UMAP(
+        n_neighbors=n_neigh,
+        n_components=n_comp,
+        min_dist=0.0,
+        metric="cosine",
+        random_state=42,
+    )
+    hdbscan_model = HDBSCAN(
+        min_cluster_size=mcs,
+        min_samples=1,
+        metric="euclidean",
+        prediction_data=True,
+        cluster_selection_method="leaf",
+        core_dist_n_jobs=-1,
+    )
+    return umap_model, hdbscan_model
+
+
+def embedding_cache_path(attr, lang_tag, texts):
+    h = hashlib.sha1()
+    h.update(SBERT_MODEL.encode("utf-8"))
+    h.update(lang_tag.encode("utf-8"))
+    h.update(attr.encode("utf-8"))
+    for text in texts:
+        encoded = text.encode("utf-8", errors="ignore")
+        h.update(len(encoded).to_bytes(8, "little"))
+        h.update(encoded)
+    safe_attr = re.sub(r"[^A-Za-z0-9가-힣_-]+", "_", attr).strip("_")
+    return os.path.join(EMBED_CACHE_DIR, f"{safe_attr}_{lang_tag}_{h.hexdigest()[:16]}.npy")
+
+
+def embed_texts(texts, attr, sbert, lang_tag):
     import time as _t
-    n = len(texts)
-    print(f"    [{lang_tag}] {n}건 임베딩 시작...", flush=True)
+
+    os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+    cache_path = embedding_cache_path(attr, lang_tag, texts)
+    if os.path.exists(cache_path):
+        _t0 = _t.time()
+        embeddings = np.load(cache_path)
+        print(f"    [{lang_tag}] 임베딩 캐시 로드: {_t.time()-_t0:.1f}s, shape={embeddings.shape}", flush=True)
+        return embeddings
+
+    print(f"    [{lang_tag}] {len(texts)}건 임베딩 시작...", flush=True)
     _t0 = _t.time()
     embeddings = sbert.encode(texts, show_progress_bar=True,
                                batch_size=SBERT_BATCH,
                                normalize_embeddings=True,
-                               device='cuda')   # (n, 1024)
+                               device=str(sbert.device))   # (n, 1024)
     print(f"    [{lang_tag}] 임베딩 완료: {_t.time()-_t0:.1f}s, shape={embeddings.shape}", flush=True)
+    np.save(cache_path, embeddings)
+    print(f"    [{lang_tag}] 임베딩 캐시 저장: {cache_path}", flush=True)
+    return embeddings
+
+
+def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
+    import time as _t
+    n = len(texts)
+    embeddings = embed_texts(texts, attr, sbert, lang_tag)
 
     stopwords = BASE_STOPWORDS + ATTR_EXTRA_STOPWORDS.get(attr, [])
     # BGE-M3 응집 강해 mcs 공식·min_samples·cluster_selection_method 재튜닝 (2026-05-24)
-    mcs        = max(8, n // 200)
+    import math
+    mcs        = max(8, math.ceil(0.6 * math.sqrt(n)))
     n_comp     = 10 if n > 800 else 5
     n_neigh    = 15
 
     print(f"    min_cluster_size={mcs}, n_comp={n_comp}, n_neigh={n_neigh}")
 
+    fit_texts = texts
     if lang_tag == "en":
         vectorizer_model = CountVectorizer(
             stop_words=stopwords, min_df=2, ngram_range=(1, 2),
             token_pattern=r'(?u)\b[a-zA-Z가-힣]{2,}\b')
     else:  # "ko" or "mixed" — Kiwi 명사 추출로 조사 결합형 해소
+        print(f"    [{lang_tag}] Kiwi 병렬 토큰화 시작...", flush=True)
+        _tok0 = _t.time()
+        fit_texts = pretokenize_ko_texts(texts)
+        print(f"    [{lang_tag}] Kiwi 병렬 토큰화 완료: {_t.time()-_tok0:.1f}s", flush=True)
         vectorizer_model = CountVectorizer(
-            tokenizer=ko_tokenizer, lowercase=False,
-            stop_words=stopwords, min_df=2, ngram_range=(1, 1))   # 진단: ngram=(1,1)
+            lowercase=False,
+            stop_words=stopwords, min_df=2, ngram_range=(1, 2))
+
+    umap_model, hdbscan_model = make_cluster_models(n_neigh, n_comp, mcs)
 
     topic_model = BERTopic(
         embedding_model=sbert,
-        umap_model=UMAP(n_neighbors=n_neigh, n_components=n_comp,
-                        min_dist=0.0, metric='cosine', random_state=42),
-        hdbscan_model=HDBSCAN(min_cluster_size=mcs, min_samples=1,
-                               metric='euclidean', prediction_data=True,
-                               cluster_selection_method='leaf'),
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
         vectorizer_model=vectorizer_model,
-        representation_model=KeyBERTInspired(),
+        representation_model=KeyBERTInspired() if USE_KEYBERT_REPRESENTATION else None,
         seed_topic_list=SEED_TOPICS.get(attr),
         nr_topics="auto",
         verbose=False,
     )
-    topics, _ = topic_model.fit_transform(texts, embeddings)
+    print(f"    [{lang_tag}] BERTopic fit 시작...", flush=True)
+    _t1 = _t.time()
+    topics, _ = topic_model.fit_transform(fit_texts, embeddings)
+    print(f"    [{lang_tag}] BERTopic fit 완료: {_t.time()-_t1:.1f}s", flush=True)
 
     n_topics  = len([t for t in set(topics) if t != -1])
     n_out     = sum(1 for t in topics if t == -1)
@@ -485,7 +593,7 @@ Provide a subtopic label (3-6 words).
 Respond ONLY with JSON: {{"en": "English label", "ko": "Korean label"}}"""
 
     try:
-        resp  = client.chat.completions.create(
+        resp  = _get_client().chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=0,
@@ -523,6 +631,7 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
         print(f"[{attr}] {n_total}건 — 스킵")
         return None
 
+    ids     = [a.get("id","")  for a in subset]
     texts   = [a["text"]   for a in subset]
     sources = [a["source"] for a in subset]
     langs   = [a["lang"]   for a in subset]
@@ -534,17 +643,25 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
 
     run_separately = (n_en >= 30 and n_ko >= 30)
 
+    assignments = []   # [(article_id, source, lang, topic_id), ...]
     if run_separately:
         # ── 언어별 분리 실행 ──
         en_idx  = [i for i,l in enumerate(langs) if l=="en"]
         ko_idx  = [i for i,l in enumerate(langs) if l=="ko"]
         en_texts   = [texts[i]   for i in en_idx]
         en_sources = [sources[i] for i in en_idx]
+        en_ids     = [ids[i]     for i in en_idx]
         ko_texts   = [texts[i]   for i in ko_idx]
         ko_sources = [sources[i] for i in ko_idx]
+        ko_ids     = [ids[i]     for i in ko_idx]
 
         en_topics_data, en_emb, en_topics = run_bertopic_lang(en_texts, en_sources, attr, sbert, "en")
         ko_topics_data, ko_emb, ko_topics = run_bertopic_lang(ko_texts, ko_sources, attr, sbert, "ko")
+
+        for aid, src, tid in zip(en_ids, en_sources, en_topics):
+            assignments.append((aid, src, "en", int(tid)))
+        for aid, src, tid in zip(ko_ids, ko_sources, ko_topics):
+            assignments.append((aid, src, "ko", int(tid)))
 
         # ── 의미 정렬 ──
         en_only, ko_only, merged = align_topics(en_topics_data, ko_topics_data)
@@ -557,6 +674,8 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
         # 통합 실행 (언어 분리 불가)
         print("  통합 모드 (언어 분리 불가)")
         topics_data, emb, topics = run_bertopic_lang(texts, sources, attr, sbert, "mixed")
+        for aid, src, tid in zip(ids, sources, topics):
+            assignments.append((aid, src, "mixed", int(tid)))
         all_topics = [dict(v, type="mixed", topic_id=k) for k,v in topics_data.items()]
         n_outliers = sum(1 for t in topics if t==-1)
         merged, en_only, ko_only = [], [], all_topics
@@ -586,7 +705,55 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
         "n_ko_only":  len(ko_only),
         "n_outliers": n_outliers,
         "topics":     all_topics,
+        "assignments": assignments,
     }
+
+
+# ──────────────────────────────────────────────
+# DuckDB: article→subtopic 매핑 저장
+# ──────────────────────────────────────────────
+ASSIGNMENT_TABLE = "subtopic_assignments"
+
+def write_assignments_to_db(results):
+    """Append per-article subtopic assignment to ANALYSIS_DB.
+
+    Schema:
+      attr           VARCHAR     -- e.g. '책임/윤리AI'
+      article_id     VARCHAR     -- 'guardian:..' / 'nyt:..' / 'kr:<news_id>'
+      source         VARCHAR     -- provider name (KBS/MBC/.. or 'guardian'/'nyt')
+      lang           VARCHAR     -- 'en' / 'ko' / 'mixed'
+      topic_id       INTEGER     -- per (attr,lang) topic; -1 = outlier
+      run_timestamp  TIMESTAMP   -- same value for every row in this run
+    """
+    from datetime import datetime
+    rows = []
+    run_ts = datetime.now()
+    for attr, data in results.items():
+        for aid, src, lang, tid in data.get("assignments", []):
+            if not aid:        # skip articles missing an id
+                continue
+            rows.append((attr, aid, src, lang, tid, run_ts))
+    if not rows:
+        print("  [DB] no assignments to write")
+        return
+    con = duckdb.connect(config.ANALYSIS_DB_PATH)
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {ASSIGNMENT_TABLE} (
+            attr           VARCHAR,
+            article_id     VARCHAR,
+            source         VARCHAR,
+            lang           VARCHAR,
+            topic_id       INTEGER,
+            run_timestamp  TIMESTAMP
+        )
+    """)
+    con.executemany(
+        f"INSERT INTO {ASSIGNMENT_TABLE} VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    con.close()
+    print(f"  [DB] wrote {len(rows):,} rows to {ASSIGNMENT_TABLE} "
+          f"(run_timestamp={run_ts.isoformat(timespec='seconds')})")
 
 
 # ──────────────────────────────────────────────
@@ -602,15 +769,36 @@ def clean_for_save(results):
     return results
 
 
+def resolve_cluster_backend(requested, cuda_available):
+    if requested == "cpu" or not cuda_available:
+        return "cpu"
+    try:
+        import cuml  # noqa: F401
+        return "cuml"
+    except Exception as e:
+        if requested == "cuml":
+            raise RuntimeError("cuML backend requested but cuML is unavailable") from e
+        print(f"cuML unavailable, falling back to CPU: {e}", flush=True)
+        return "cpu"
+
+
 def main():
+    global CLUSTER_BACKEND, DETERMINISTIC_CLUSTERING, USE_KEYBERT_REPRESENTATION
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--attr", nargs="+")
     parser.add_argument("--no-label", action="store_true",
                         help="GPT 라벨링 스킵 (키워드 상위 3개를 라벨로 사용)")
+    parser.add_argument("--backend", choices=["auto", "cuml", "cpu"], default="auto",
+                        help="UMAP/HDBSCAN backend. auto uses cuML when CUDA is available.")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use deterministic clustering settings. Slower with cuML.")
+    parser.add_argument("--no-keybert", action="store_true",
+                        help="Skip KeyBERTInspired topic representation for faster diagnostics.")
     args = parser.parse_args()
 
     print("=== BERTopic v4: 언어 분리 + 의미 정렬 ===\n")
-    print(f"병합 임계값: {MERGE_THRESHOLD}\n")
+    print(f"병합 임계값: {MERGE_THRESHOLD}")
 
     articles = load_news()
     dist = Counter(a["attr"] for a in articles)
@@ -624,6 +812,14 @@ def main():
     print(f"\nLoading SBERT model: {SBERT_MODEL} ...")
     import torch
     _device = "cuda" if torch.cuda.is_available() else "cpu"
+    CLUSTER_BACKEND = resolve_cluster_backend(args.backend, torch.cuda.is_available())
+    DETERMINISTIC_CLUSTERING = args.deterministic
+    USE_KEYBERT_REPRESENTATION = not args.no_keybert
+    print(f"UMAP/HDBSCAN backend: {CLUSTER_BACKEND}"
+          f"{' (deterministic)' if DETERMINISTIC_CLUSTERING else ''}\n",
+          flush=True)
+    print(f"KeyBERT representation: {'on' if USE_KEYBERT_REPRESENTATION else 'off'}")
+    print(f"Kiwi workers: {KIWI_WORKERS}\n", flush=True)
     sbert = SentenceTransformer(SBERT_MODEL, device=_device)
     print(f"  device: {sbert.device}, cuda_available: {torch.cuda.is_available()}", flush=True)
 
@@ -641,6 +837,12 @@ def main():
         if res:
             results[attr] = res
 
+    # ── DuckDB: article→topic 매핑 저장 ──
+    write_assignments_to_db(results)
+
+    # JSON에는 assignments(대량) 빼고 저장
+    for d in results.values():
+        d.pop("assignments", None)
     clean_for_save(results)
 
     with open(OUTPUT, "w", encoding="utf-8") as f:

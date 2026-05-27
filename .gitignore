@@ -9,9 +9,10 @@ graphrag_workspace/logs/
 __pycache__/
 *.pyc
 data/
+output/
+.cache/
 .vscode/
 .idea/
-figures/
 *.png
 *.jpg
 *.pdf
