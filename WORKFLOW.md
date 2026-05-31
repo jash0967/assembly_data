@@ -266,7 +266,7 @@ Carvão Appendix II 기준 정본:
 | `figures/_legacy/generate_timeline*.py` | 옛 시계열 그림 (make_figures로 통합됨) |
 | `figures/_legacy/generate_figures.py` | 옛 보고서 그림 (make_figures로 통합됨) |
 | `figures/_legacy/build_treemap_*.py` | 옛 트리맵 데이터 |
-| [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 — EN/KO cross-lingual 정렬, Kiwi 명사 토큰화, cuML GPU 백엔드 (`--backend cuml`), 매핑 → `subtopic_assignments` |
+| [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 — **언어별 독립 분류**(`--lang ko`, EN/KO cross-lingual 병합 제거), Kiwi 명사 토큰화, cuML GPU. 3단계 분리: ① 클러스터링(`--cluster-method eom --deterministic --no-label`) ② GPT 라벨링(`--label-only`, centroid 50제목+점수) ③ 토픽 그룹화(`--group-topics`, centroid average-linkage sim≥0.80, AI안전 제외). 매핑 → `subtopic_assignments` |
 | [figures/temporal_top10.py](figures/temporal_top10.py) | 분기별 소주제 Top-10 랭킹 변동 — Bump chart(Plotly) + Lifespan Gantt(matplotlib) |
 
 ---
@@ -349,11 +349,21 @@ python analyze/export_bills.py all                          # 법안 속성별 (
 python analyze/news_descriptive.py --report                 # 뉴스 데이터/리포트/CSV (그림 생성 안 함)
 python analyze/make_figures.py                              # fig01~fig06 + report41a/b/c + figures_data.xlsx
 
-# 9. BERTopic 소주제 추출 + 시계열 시각화 (분기별 Top-10 동적 랭킹)
-python analyze/subtopic_bertopic.py --backend cuml --no-label
-# → data/analysis/subtopics_bertopic.json (토픽 키워드)
-# → assembly_analysis.duckdb::subtopic_assignments (article→topic 매핑)
-# CPU만 가능하면 --backend cpu (KO 36k 기준 ~5분 → ~1시간으로 늘어남)
+# 9. BERTopic 소주제 추출 — KO 단독, 3단계 분리 (클러스터링/라벨링/그룹화 독립)
+#    ① 클러스터링: deterministic(재현 가능) + 키워드 임시 라벨 + 대표문서 보존 + DB write
+python analyze/subtopic_bertopic.py --lang ko --cluster-method eom --deterministic --no-label
+#    ② GPT 라벨링: centroid 최근접 50제목+점수 → 토픽 라벨, 묶음그룹은 하위 라벨 기반 상위 라벨
+python analyze/subtopic_bertopic.py --label-only
+#    ③ 토픽 그룹화: centroid average-linkage sim≥0.80 으로 group_id 부여 (AI안전 제외)
+python analyze/subtopic_bertopic.py --group-topics --group-threshold 0.80
+# → output/analysis/subtopics_bertopic.json (토픽 라벨 + group_id + group_label)
+# → news_analysis.duckdb::subtopic_assignments (article→topic, lang='ko')
+# 비결정성 주의: ②③ 는 ① 의 클러스터/대표문서를 재사용 — ① 재실행 없이 재라벨/재그룹 가능.
+#   단 ① 를 다시 돌리면 토픽 구성이 바뀌므로 ②③ 도 다시 실행해야 함 (--deterministic 이라 동일 입력→동일 결과).
+# 영문(US/UK) subtopic 은 기사량이 적어 별도 진행 (--lang en) — 현재는 KO 만 정본.
+
+# 기사 제목 리스트(속성>그룹>토픽) 산출물:
+python working/export_ko_lists.py    # → output/article_lists_ko.md
 
 python figures/temporal_top10.py
 # → figures/out/temporal_top10_bump.html (인터랙티브)

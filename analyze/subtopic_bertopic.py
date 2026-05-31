@@ -103,9 +103,23 @@ SBERT_MODEL     = "BAAI/bge-m3"   # 다국어 임베딩 (1024-dim, XLM-R-large �
 SBERT_BATCH     = 16              # BGE-M3는 VRAM 더 씀 (MiniLM 64 → 16)
 MERGE_THRESHOLD = 0.68            # BGE-M3는 sim 분포가 더 높게 깔려 0.62 → 0.68 재캘리브
 
+# ── (B) 동일 언어 내 유사 토픽 사후 병합 ──
+# stability 연구(working/finding_cluster_stability.md): cuML 비결정성으로 swap되는
+# fragment들의 centroid sim 0.78~0.91 = "사람 기준 한 토픽이 sub-cluster로 쪼개진 인공물".
+# leaf 과분할을 유지한 채 sim≥임계값인 동일 언어 토픽을 transitive(connected components) 병합.
+MERGE_SIMILAR_TOPICS    = False   # --merge-similar 로 활성화
+# (B) KO(및 mixed) 토픽에만 적용 — EN 은 미병합 후 align_topics 에서 cross-lingual 정렬.
+# 임계값 0.80: working/diagnose_merge_cuml.py 의 cuML 백엔드 실측 기준. KO 토픽 centroid
+# sim 분포(median 0.72~0.77, max 0.93~0.96)에서 0.80 은 평균연결(AGG) 기준 적극 감축
+# 구간(산업 KO 99→13, 공익 49→12, 노동 34→8). 인공물 fragment 통합이 주 목적.
+MERGE_SIMILAR_THRESHOLD = 0.80    # --merge-threshold 로 조정
+
 CLUSTER_BACKEND = "cpu"
 DETERMINISTIC_CLUSTERING = False
 USE_KEYBERT_REPRESENTATION = True
+# HDBSCAN 토픽 선택 방식: "leaf"(잘게 쪼갬, 기본) / "eom"(안정적 상위 클러스터, 토픽 적음).
+# --cluster-method 로 조정. eom 은 작은 EN 데이터에서 거대 컨테이너 위험(실측 확인됨).
+CLUSTER_SELECTION_METHOD = "leaf"
 
 BASE_STOPWORDS = [
     'ai','AI','A.I','A.I.','Ai','artificial','intelligence','the','and','for','that','with',
@@ -219,48 +233,55 @@ def clean_text(t):
     t = re.sub(r'<[^>]+>','',t)
     return re.sub(r'\s+',' ',t).strip()
 
-def load_news():
-    with open(os.path.join(config.NEWS_DIR,"guardian_articles_raw.json"),encoding="utf-8") as f:
-        g_raw = json.load(f)
-    g_map = {}
-    for a in g_raw:
-        title = a.get("title","") or a.get("webTitle","")
-        trail = a.get("trail_text","") or (a.get("fields",{}) or {}).get("trailText","") or ""
-        text = clean_text(f"{title}. {trail}")
-        for key in ["id","url"]:
-            aid = a.get(key,"")
-            if aid:
-                g_map[aid] = text
-                if key=="id": g_map[f"https://www.theguardian.com/{aid}"] = text
-
-    with open(os.path.join(config.NEWS_DIR,"nyt_articles_raw.json"),encoding="utf-8") as f:
-        n_raw = json.load(f)
-    n_map = {}
-    for a in n_raw:
-        title = a.get("title","")
-        if not title:
-            h = a.get("headline",{}); title = h.get("main","") if isinstance(h,dict) else str(h)
-        abstract = a.get("abstract","") or a.get("lead_paragraph","") or ""
-        text = clean_text(f"{title}. {abstract}")
-        for key in ["url","web_url","_id","uri"]:
-            aid = a.get(key,"")
-            if aid: n_map[aid] = text
-
+def load_news(langs=("ko", "en")):
+    """기사 로드. langs 로 적재 언어 선택 — KO 단독 분석 시 ("ko",)."""
     articles = []
-    for cls_file, source, lang, text_map, normalize in [
-        ("articles_classified_guardian.json","guardian","en",g_map,True),
-        ("articles_classified_nyt.json","nyt","en",n_map,True),
-    ]:
-        with open(os.path.join(config.ANALYSIS_DIR,cls_file),encoding="utf-8") as f:
-            cls = json.load(f)
-        for a in cls:
-            attr = a.get("primary","")
-            if normalize: attr = NORMALIZE.get(attr,attr)
-            if attr not in ATTRS_KR: continue
-            aid = a.get("article_id","")
-            text = text_map.get(aid,"")
-            if len(text) > 20:
-                articles.append({"id":f"{source}:{aid}","text":text,"source":source,"attr":attr,"lang":lang})
+
+    # ── 영문 (Guardian / NYT) — langs 에 'en' 있을 때만 ──
+    if "en" in langs:
+        with open(os.path.join(config.NEWS_DIR,"guardian_articles_raw.json"),encoding="utf-8") as f:
+            g_raw = json.load(f)
+        g_map = {}
+        for a in g_raw:
+            title = a.get("title","") or a.get("webTitle","")
+            trail = a.get("trail_text","") or (a.get("fields",{}) or {}).get("trailText","") or ""
+            text = clean_text(f"{title}. {trail}")
+            for key in ["id","url"]:
+                aid = a.get(key,"")
+                if aid:
+                    g_map[aid] = text
+                    if key=="id": g_map[f"https://www.theguardian.com/{aid}"] = text
+
+        with open(os.path.join(config.NEWS_DIR,"nyt_articles_raw.json"),encoding="utf-8") as f:
+            n_raw = json.load(f)
+        n_map = {}
+        for a in n_raw:
+            title = a.get("title","")
+            if not title:
+                h = a.get("headline",{}); title = h.get("main","") if isinstance(h,dict) else str(h)
+            abstract = a.get("abstract","") or a.get("lead_paragraph","") or ""
+            text = clean_text(f"{title}. {abstract}")
+            for key in ["url","web_url","_id","uri"]:
+                aid = a.get(key,"")
+                if aid: n_map[aid] = text
+
+        for cls_file, source, lang, text_map, normalize in [
+            ("articles_classified_guardian.json","guardian","en",g_map,True),
+            ("articles_classified_nyt.json","nyt","en",n_map,True),
+        ]:
+            with open(os.path.join(config.ANALYSIS_DIR,cls_file),encoding="utf-8") as f:
+                cls = json.load(f)
+            for a in cls:
+                attr = a.get("primary","")
+                if normalize: attr = NORMALIZE.get(attr,attr)
+                if attr not in ATTRS_KR: continue
+                aid = a.get("article_id","")
+                text = text_map.get(aid,"")
+                if len(text) > 20:
+                    articles.append({"id":f"{source}:{aid}","text":text,"source":source,"attr":attr,"lang":lang})
+
+    if "ko" not in langs:
+        return articles
 
     # ── KR domestic news (news_analysis.duckdb — Stage 1+2 적용본) ──
     con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH, read_only=True)
@@ -328,7 +349,7 @@ def make_cluster_models(n_neigh, n_comp, mcs):
             min_samples=1,
             metric="euclidean",
             prediction_data=True,
-            cluster_selection_method="leaf",
+            cluster_selection_method=CLUSTER_SELECTION_METHOD,
             output_type="numpy",
         )
         return umap_model, hdbscan_model
@@ -462,7 +483,102 @@ def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
         }
         print(f"    Topic {tid} ({len(indices)}건): {', '.join(keywords[:5])}")
 
+    # (B) 병합은 호출부(process_attr)에서 KO·mixed 에만 선택 적용 — EN 은 미병합.
     return topics_data, embeddings, topics
+
+
+def apply_b_merge(topics_data, topics, lang_tag):
+    """(B) 동일 언어 유사 토픽 병합을 topics_data + topics(article→tid) 에 적용.
+
+    process_attr 에서 KO·mixed 에만 호출. EN 은 호출하지 않아 미병합 유지.
+    반환: (topics_data, topics)  — 병합 비활성·토픽<2 면 원본 그대로.
+    """
+    if not (MERGE_SIMILAR_TOPICS and len(topics_data) > 1):
+        return topics_data, topics
+    before = len(topics_data)
+    topics_data, remap = merge_similar_topics_data(topics_data, MERGE_SIMILAR_THRESHOLD)
+    topics = [remap.get(t, t) if t != -1 else -1 for t in topics]
+    n_groups = sum(1 for v in topics_data.values() if v.get("n_merged_subtopics", 1) > 1)
+    print(f"    [{lang_tag}] 유사 토픽 병합: {before}개 → {len(topics_data)}개 "
+          f"(sim≥{MERGE_SIMILAR_THRESHOLD}, 병합그룹 {n_groups}개)", flush=True)
+    return topics_data, topics
+
+
+# ──────────────────────────────────────────────
+# (B) 동일 언어 유사 토픽 병합 (transitive / connected components)
+# ──────────────────────────────────────────────
+def merge_similar_topics_data(topics_data, threshold):
+    """같은 언어의 토픽들 중 centroid 코사인 유사도 >= threshold 인 것들을
+    connected components 로 묶어 하나로 병합.
+
+    1:1 매칭이 아니라 transitive: A~B, B~C 이면 {A,B,C} 한 그룹.
+    각 그룹의 대표 topic_id 는 최대 count 토픽.
+
+    반환: (new_topics_data, remap)
+      new_topics_data: {대표_tid: 병합된 토픽 dict}  (구조는 입력과 동일 + n_merged_subtopics)
+      remap: {old_tid: 대표_tid}  — 호출부에서 article→topic 배열 remap 에 사용
+    """
+    tids = list(topics_data.keys())
+    if len(tids) <= 1:
+        return topics_data, {t: t for t in tids}
+
+    centroids = np.stack([topics_data[t]["centroid"] for t in tids])
+
+    # average-linkage 계층 군집 (centroid 코사인 거리, 1-sim).
+    # single-linkage(union-find)는 A~B~C~D 사슬(chaining)로 의미가 먼 토픽까지
+    # 한 덩어리로 묶어 거대 컨테이너를 만든다. average-linkage 는 "그룹 전체와
+    # 평균적으로 가까워야 합류"하므로 chaining 없이 안전하게 병합한다.
+    from collections import defaultdict
+    n = len(tids)
+    sim = cosine_similarity(centroids)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+    dist = (dist + dist.T) / 2.0
+    from scipy.cluster.hierarchy import linkage, fcluster
+    Z = linkage(dist[np.triu_indices(n, 1)], method="average")
+    labels = fcluster(Z, t=1.0 - threshold, criterion="distance")
+    groups = defaultdict(list)
+    for t, lab in zip(tids, labels):
+        groups[int(lab)].append(t)
+
+    new_topics_data, remap = {}, {}
+    for members in groups.values():
+        if len(members) == 1:
+            t = members[0]
+            new_topics_data[t] = topics_data[t]
+            remap[t] = t
+            continue
+
+        # 대표 = 최대 count
+        members_sorted = sorted(members, key=lambda t: topics_data[t]["count"], reverse=True)
+        rep   = members_sorted[0]
+        total = sum(topics_data[t]["count"] for t in members)
+
+        # count 가중 centroid
+        cent = sum(topics_data[t]["centroid"] * topics_data[t]["count"] for t in members) / total
+
+        # 키워드 union (큰 토픽 우선, 중복 제거)
+        kw_order, seen_kw, merged_src = [], set(), {}
+        for t in members_sorted:
+            for k in topics_data[t]["keywords"]:
+                if k not in seen_kw:
+                    seen_kw.add(k); kw_order.append(k)
+            for src, c in topics_data[t]["source_dist"].items():
+                merged_src[src] = merged_src.get(src, 0) + c
+
+        new_topics_data[rep] = {
+            "lang":               topics_data[rep]["lang"],
+            "keywords":           kw_order[:10],
+            "count":              total,
+            "source_dist":        merged_src,
+            "centroid":           cent,
+            "representative_docs": topics_data[rep]["representative_docs"],
+            "n_merged_subtopics": len(members),
+        }
+        for t in members:
+            remap[t] = rep
+
+    return new_topics_data, remap
 
 
 # ──────────────────────────────────────────────
@@ -639,44 +755,35 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
     print(f"\n{'='*60}")
     print(f"[{attr}] 총 {n_total}건 — EN:{n_en} / KO:{n_ko}")
 
-    run_separately = (n_en >= 30 and n_ko >= 30)
-
+    # ── 언어별 독립 분류 (cross-lingual merge 없음) ──
+    # 각 언어를 따로 BERTopic → 각 토픽은 그 언어 전용(en_only / ko_only).
+    # EN 은 기사량이 적어 단독 subtopic 분석이 부정확하므로 기본 미적재(--lang ko).
     assignments = []   # [(article_id, source, lang, topic_id), ...]
-    if run_separately:
-        # ── 언어별 분리 실행 ──
-        en_idx  = [i for i,l in enumerate(langs) if l=="en"]
-        ko_idx  = [i for i,l in enumerate(langs) if l=="ko"]
-        en_texts   = [texts[i]   for i in en_idx]
-        en_sources = [sources[i] for i in en_idx]
-        en_ids     = [ids[i]     for i in en_idx]
-        ko_texts   = [texts[i]   for i in ko_idx]
-        ko_sources = [sources[i] for i in ko_idx]
-        ko_ids     = [ids[i]     for i in ko_idx]
+    all_topics = []
+    n_outliers = 0
+    type_counts = {"en_only": 0, "ko_only": 0}
 
-        en_topics_data, en_emb, en_topics = run_bertopic_lang(en_texts, en_sources, attr, sbert, "en")
-        ko_topics_data, ko_emb, ko_topics = run_bertopic_lang(ko_texts, ko_sources, attr, sbert, "ko")
+    for lang_tag, type_name in (("ko", "ko_only"), ("en", "en_only")):
+        idx = [i for i, l in enumerate(langs) if l == lang_tag]
+        if len(idx) < 30:
+            continue
+        l_texts   = [texts[i]   for i in idx]
+        l_sources = [sources[i] for i in idx]
+        l_ids     = [ids[i]     for i in idx]
 
-        for aid, src, tid in zip(en_ids, en_sources, en_topics):
-            assignments.append((aid, src, "en", int(tid)))
-        for aid, src, tid in zip(ko_ids, ko_sources, ko_topics):
-            assignments.append((aid, src, "ko", int(tid)))
+        topics_data, emb, topics = run_bertopic_lang(l_texts, l_sources, attr, sbert, lang_tag)
+        # (B) 동일 언어 유사 토픽 병합 (기본 OFF; --merge-similar 시에만)
+        topics_data, topics = apply_b_merge(topics_data, topics, lang_tag)
 
-        # ── 의미 정렬 ──
-        en_only, ko_only, merged = align_topics(en_topics_data, ko_topics_data)
+        for aid, src, tid in zip(l_ids, l_sources, topics):
+            assignments.append((aid, src, lang_tag, int(tid)))
+        all_topics += [dict(v, type=type_name, topic_id=k) for k, v in topics_data.items()]
+        n_outliers += sum(1 for t in topics if t == -1)
+        type_counts[type_name] = len(topics_data)
 
-        all_topics = merged + en_only + ko_only
-        n_outliers = (sum(1 for t in en_topics if t==-1) +
-                      sum(1 for t in ko_topics if t==-1))
-
-    else:
-        # 통합 실행 (언어 분리 불가)
-        print("  통합 모드 (언어 분리 불가)")
-        topics_data, emb, topics = run_bertopic_lang(texts, sources, attr, sbert, "mixed")
-        for aid, src, tid in zip(ids, sources, topics):
-            assignments.append((aid, src, "mixed", int(tid)))
-        all_topics = [dict(v, type="mixed", topic_id=k) for k,v in topics_data.items()]
-        n_outliers = sum(1 for t in topics if t==-1)
-        merged, en_only, ko_only = [], [], all_topics
+    merged   = []
+    en_only  = [t for t in all_topics if t["type"] == "en_only"]
+    ko_only  = [t for t in all_topics if t["type"] == "ko_only"]
 
     # ── 라벨링 ──
     attr_en = KR_TO_EN.get(attr, attr)
@@ -757,14 +864,259 @@ def write_assignments_to_db(results):
 # ──────────────────────────────────────────────
 # 정리: centroid 제거 후 저장
 # ──────────────────────────────────────────────
-def clean_for_save(results):
+def clean_for_save(results, keep_repr=False):
+    """centroid 는 항상 제거. keep_repr=True 면 대표문서 유지(--label-only 가 사용)."""
     for attr, data in results.items():
         for t in data["topics"]:
             t.pop("centroid", None)
-            t.pop("representative_docs", None)
-            t.pop("representative_docs_en", None)
-            t.pop("representative_docs_ko", None)
+            if not keep_repr:
+                t.pop("representative_docs", None)
+                t.pop("representative_docs_en", None)
+                t.pop("representative_docs_ko", None)
     return results
+
+
+LABEL_CENTROID_CAP = 50   # centroid 최근접 상위 N개 제목을 GPT 에 투입
+
+
+def _label_titles_by_centroid(attr, topics, articles, db_topic):
+    """attr 의 각 토픽에 대해 centroid 최근접 상위 LABEL_CENTROID_CAP 개 제목 + 점수 반환.
+    반환: {topic_id: [(score, title), ...] 점수 내림차순}."""
+    import glob
+    subset = [a for a in articles if a["attr"] == attr]
+    ids   = [a["id"]   for a in subset]
+    safe_attr = re.sub(r"[^A-Za-z0-9가-힣_-]+", "_", attr).strip("_")
+    cands = [f for f in glob.glob(os.path.join(EMBED_CACHE_DIR, f"{safe_attr}_ko_*.npy"))
+             if "_meta" not in f]
+    if not cands:
+        return {}
+    emb = np.load(max(cands, key=os.path.getmtime))
+    if len(emb) != len(ids):
+        print(f"  ⚠ [{attr}] 캐시({len(emb)})≠기사({len(ids)}) — centroid 라벨 스킵")
+        return {}
+    id2row = {aid: i for i, aid in enumerate(ids)}
+    from collections import defaultdict
+    by_t = defaultdict(list)   # topic_id -> [(row, title)]
+    for aid, (tid, title) in db_topic.get(attr, {}).items():
+        if tid == -1 or aid not in id2row:
+            continue
+        by_t[tid].append((id2row[aid], title))
+    out = {}
+    for tid, items in by_t.items():
+        rws = [r for r, _ in items]
+        tts = [t for _, t in items]
+        cent = emb[rws].mean(axis=0, keepdims=True)
+        sims = cosine_similarity(emb[rws], cent).ravel()
+        order = np.argsort(-sims)[:LABEL_CENTROID_CAP]
+        out[tid] = [(float(sims[i]), tts[i]) for i in order]
+    return out
+
+
+def label_topic_centroid(attr_en, scored):
+    """centroid 점수 표기된 제목들로 토픽 라벨 생성 (저점 outlier 무시 지시)."""
+    body = "\n".join(f"- [{s:.2f}] {t}" for s, t in scored)
+    prompt = f"""AI policy subtopic in "{attr_en}". Korean article titles sorted by
+representativeness score [0-1] = cosine similarity to the cluster centroid (higher = central).
+
+Titles ({len(scored)}):
+{body}
+
+Give ONE concise subtopic label (3-7 words) for the dominant theme of the high-score titles.
+Ignore rare low-score outliers. Respond ONLY with JSON: {{"en": "English label", "ko": "한국어 라벨"}}"""
+    try:
+        r = _get_client().chat.completions.create(
+            model="gpt-4.1-mini", messages=[{"role": "user", "content": prompt}],
+            temperature=0, response_format={"type": "json_object"})
+        o = json.loads(r.choices[0].message.content)
+        return o.get("ko", ""), o.get("en", "")
+    except Exception as e:
+        print(f"    GPT 오류(topic): {e}")
+        return "", ""
+
+
+def label_group_umbrella(attr_en, members):
+    """묶음 그룹의 상위 라벨 — 하위 토픽 라벨+건수+키워드 기반.
+    members: [(label_ko, count, keywords_str), ...]"""
+    body = "\n".join(f"- ({c}건) {lk}  [kw: {kw}]" for lk, c, kw in members)
+    prompt = f"""AI policy attribute "{attr_en}". Below are sub-topics grouped together
+because their article embeddings are similar (count + label each).
+
+Sub-topics ({len(members)}):
+{body}
+
+Write ONE umbrella label (3-8 words) capturing what these sub-topics SHARE.
+- Cover the MAJORITY of sub-topics (weight by article count), not just one.
+- General enough to encompass them, but specific to this attribute.
+Respond ONLY with JSON: {{"en": "English umbrella label", "ko": "한국어 상위 라벨"}}"""
+    try:
+        r = _get_client().chat.completions.create(
+            model="gpt-4.1-mini", messages=[{"role": "user", "content": prompt}],
+            temperature=0, response_format={"type": "json_object"})
+        o = json.loads(r.choices[0].message.content)
+        return o.get("ko", ""), o.get("en", "")
+    except Exception as e:
+        print(f"    GPT 오류(group): {e}")
+        return "", ""
+
+
+def run_label_only():
+    """클러스터링 재실행 없이 저장된 JSON 토픽에 GPT 라벨 부여 (centroid 점수 기반).
+
+    1) 토픽 라벨: centroid 최근접 상위 N개 제목(점수표기) → GPT
+    2) 그룹 라벨(묶음): 하위 토픽 라벨 + 건수 + 키워드 → GPT 상위 라벨 (group_label_ko/en)
+    3) 단독 토픽: 토픽 라벨 그대로
+    centroid 점수는 임베딩 캐시 + DB(최신 run) 에서 재계산 → 클러스터링 재실행 불필요."""
+    import time as _t
+    from collections import defaultdict
+    if not os.path.exists(OUTPUT):
+        print(f"[label-only] {OUTPUT} 없음 — 먼저 클러스터링을 실행하세요.")
+        return
+    with open(OUTPUT, encoding="utf-8") as f:
+        results = json.load(f)
+
+    # DB: article_id -> (topic_id, title), attr 별
+    articles = load_news(langs=("ko",))
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH, read_only=True)
+    run = con.execute("SELECT max(run_timestamp) FROM subtopic_assignments").fetchone()[0]
+    rows = con.execute("""
+        SELECT a.attr, a.article_id, a.topic_id, n.title
+        FROM subtopic_assignments a
+        LEFT JOIN news_articles n ON a.article_id = ('kr:' || n.news_id)
+        WHERE a.run_timestamp = ? AND a.lang = 'ko'
+    """, [run]).fetchall()
+    con.close()
+    db_topic = defaultdict(dict)
+    for attr, aid, tid, title in rows:
+        db_topic[attr][aid] = (tid, clean_text(title) or "(제목없음)")
+
+    for attr, data in results.items():
+        attr_en = KR_TO_EN.get(attr, attr)
+        topics = data.get("topics", [])
+        scored_by_tid = _label_titles_by_centroid(attr, topics, articles, db_topic)
+
+        # 1) 토픽 라벨
+        for t in topics:
+            scored = scored_by_tid.get(t["topic_id"])
+            if scored:
+                lk, le = label_topic_centroid(attr_en, scored); _t.sleep(0.1)
+            else:   # centroid 실패 시 키워드 fallback
+                lk = le = ", ".join(t.get("keywords", [])[:3])
+            t["label_ko"], t["label_en"] = lk, le
+
+        # 2) 그룹 단위 라벨
+        groups = defaultdict(list)
+        for t in topics:
+            groups[t.get("group_id", t["topic_id"])].append(t)
+        n_grp = 0
+        for gid, members in groups.items():
+            if len(members) <= 1:
+                continue   # 단독: 토픽 라벨 그대로
+            members = sorted(members, key=lambda x: x.get("count", 0), reverse=True)
+            payload = [(m.get("label_ko", ""), m.get("count", 0),
+                        ", ".join(m.get("keywords", [])[:5])) for m in members]
+            gk, ge = label_group_umbrella(attr_en, payload); _t.sleep(0.1)
+            for m in members:
+                m["group_label_ko"], m["group_label_en"] = gk, ge
+            n_grp += 1
+        print(f"[{attr}] 토픽 {len(topics)} 라벨 + 묶음그룹 {n_grp} 상위라벨", flush=True)
+
+    clean_for_save(results, keep_repr=False)
+    with open(OUTPUT, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n저장(라벨 갱신): {OUTPUT}")
+
+
+# ──────────────────────────────────────────────
+# (C) 토픽 그룹화 — centroid average-linkage 로 토픽을 상위 그룹으로 묶기
+# ──────────────────────────────────────────────
+GROUP_EXCLUDE_ATTRS = {"AI안전"}   # 토픽 수가 적어 그룹화 시 1그룹으로 뭉개지는 attr
+
+
+def _topic_centroids_from_cache(attr, articles, db_topic):
+    """attr 의 (topic_id -> centroid) 를 임베딩 캐시 + DB assignment 에서 재계산.
+    반환: {topic_id: centroid(np.array)} (outlier -1 제외)."""
+    import glob
+    subset = [a for a in articles if a["attr"] == attr]
+    ids = [a["id"] for a in subset]
+    safe_attr = re.sub(r"[^A-Za-z0-9가-힣_-]+", "_", attr).strip("_")
+    cands = [f for f in glob.glob(os.path.join(EMBED_CACHE_DIR, f"{safe_attr}_ko_*.npy"))
+             if "_meta" not in f]
+    if not cands:
+        return None
+    emb = np.load(max(cands, key=os.path.getmtime))
+    if len(emb) != len(ids):
+        print(f"  ⚠ [{attr}] 캐시({len(emb)})≠기사({len(ids)}) — 그룹화 스킵")
+        return None
+    from collections import defaultdict
+    acc = defaultdict(list)
+    for i, aid in enumerate(ids):
+        t = db_topic.get(aid)
+        if t is None or t == -1:
+            continue
+        acc[t].append(emb[i])
+    return {t: np.mean(v, axis=0) for t, v in acc.items()}
+
+
+def run_group_topics(threshold):
+    """저장된 JSON 토픽에 group_id 부여 (average-linkage, attr별 독립).
+    centroid 는 임베딩 캐시 + DB(최신 run) 에서 재계산 → step1 재실행 불필요."""
+    from scipy.cluster.hierarchy import linkage, fcluster
+
+    if not os.path.exists(OUTPUT):
+        print(f"[group] {OUTPUT} 없음 — 먼저 클러스터링을 실행하세요.")
+        return
+    with open(OUTPUT, encoding="utf-8") as f:
+        results = json.load(f)
+
+    articles = load_news(langs=("ko",))
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH, read_only=True)
+    run = con.execute("SELECT max(run_timestamp) FROM subtopic_assignments").fetchone()[0]
+    rows = con.execute("SELECT article_id, topic_id FROM subtopic_assignments "
+                       "WHERE run_timestamp=? AND lang='ko'", [run]).fetchall()
+    con.close()
+    db_topic = {aid: tid for aid, tid in rows}
+
+    print(f"=== 토픽 그룹화 (sim≥{threshold}, average-linkage) ===")
+    for attr, data in results.items():
+        topics = data.get("topics", [])
+        # 제외 attr 또는 토픽<2 → 각 토픽이 독립 그룹
+        if attr in GROUP_EXCLUDE_ATTRS or len(topics) < 2:
+            for i, t in enumerate(topics):
+                t["group_id"] = i
+            data["n_groups"] = len(topics)
+            print(f"  [{attr}] 그룹화 제외 — {len(topics)}토픽 = {len(topics)}그룹")
+            continue
+
+        cents_map = _topic_centroids_from_cache(attr, articles, db_topic)
+        if not cents_map:
+            for i, t in enumerate(topics):
+                t["group_id"] = i
+            data["n_groups"] = len(topics)
+            continue
+
+        tids = [t["topic_id"] for t in topics]
+        # centroid 없는 토픽(드묾) 방어: 자기 자신 그룹
+        usable = [tid for tid in tids if tid in cents_map]
+        cents = np.stack([cents_map[tid] for tid in usable])
+        sim = cosine_similarity(cents)
+        dist = 1.0 - sim
+        np.fill_diagonal(dist, 0.0)
+        dist = (dist + dist.T) / 2.0
+        Z = linkage(dist[np.triu_indices(len(usable), 1)], method="average")
+        labels = fcluster(Z, t=1.0 - threshold, criterion="distance")
+        gid_of = {tid: int(lab) for tid, lab in zip(usable, labels)}
+        next_gid = (max(labels) + 1) if len(labels) else 0
+        for t in topics:
+            if t["topic_id"] in gid_of:
+                t["group_id"] = gid_of[t["topic_id"]]
+            else:
+                t["group_id"] = next_gid; next_gid += 1
+        data["n_groups"] = len(set(t["group_id"] for t in topics))
+        print(f"  [{attr}] {len(topics)}토픽 → {data['n_groups']}그룹")
+
+    with open(OUTPUT, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n저장(그룹 갱신): {OUTPUT}")
 
 
 def resolve_cluster_backend(requested, cuda_available):
@@ -782,6 +1134,7 @@ def resolve_cluster_backend(requested, cuda_available):
 
 def main():
     global CLUSTER_BACKEND, DETERMINISTIC_CLUSTERING, USE_KEYBERT_REPRESENTATION
+    global MERGE_SIMILAR_TOPICS, MERGE_SIMILAR_THRESHOLD, CLUSTER_SELECTION_METHOD
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--attr", nargs="+")
@@ -793,12 +1146,46 @@ def main():
                         help="Use deterministic clustering settings. Slower with cuML.")
     parser.add_argument("--no-keybert", action="store_true",
                         help="Skip KeyBERTInspired topic representation for faster diagnostics.")
+    parser.add_argument("--merge-similar", action="store_true",
+                        help="(B) 동일 언어 내 centroid sim≥임계값 토픽을 transitive 병합 (과분할 완화)")
+    parser.add_argument("--merge-threshold", type=float, default=MERGE_SIMILAR_THRESHOLD,
+                        help=f"--merge-similar 의 코사인 유사도 임계값 (기본 {MERGE_SIMILAR_THRESHOLD})")
+    parser.add_argument("--cluster-method", choices=["leaf", "eom"], default=CLUSTER_SELECTION_METHOD,
+                        help="HDBSCAN 토픽 선택 방식. leaf=잘게 쪼갬(기본), eom=안정적 상위 클러스터(토픽 적음)")
+    parser.add_argument("--lang", choices=["ko", "en", "both"], default="ko",
+                        help="분류 대상 언어. ko=한국 기사만(기본), en=영문만, both=둘 다 독립 분류")
+    parser.add_argument("--label-only", action="store_true",
+                        help="클러스터링 재실행 없이 저장된 JSON 토픽에 GPT 라벨만 부여 (cuML 비결정성 분리)")
+    parser.add_argument("--group-topics", action="store_true",
+                        help="저장된 JSON 토픽을 centroid average-linkage 로 상위 그룹화 (group_id 부여)")
+    parser.add_argument("--group-threshold", type=float, default=0.80,
+                        help="--group-topics 의 코사인 유사도 임계값 (기본 0.80)")
     args = parser.parse_args()
 
-    print("=== BERTopic v4: 언어 분리 + 의미 정렬 ===\n")
-    print(f"병합 임계값: {MERGE_THRESHOLD}")
+    MERGE_SIMILAR_TOPICS    = args.merge_similar
+    MERGE_SIMILAR_THRESHOLD = args.merge_threshold
+    CLUSTER_SELECTION_METHOD = args.cluster_method
+    langs = ("ko", "en") if args.lang == "both" else (args.lang,)
 
-    articles = load_news()
+    # ── 라벨링 단계 (클러스터링·SBERT·DB 미접근) ──
+    if args.label_only:
+        print("=== GPT 라벨링 전용 (클러스터링 재실행 없음) ===\n")
+        run_label_only()
+        return
+
+    # ── 그룹화 단계 (클러스터링·SBERT 미접근, DB read-only) ──
+    if args.group_topics:
+        run_group_topics(args.group_threshold)
+        return
+
+    print("=== BERTopic v5: 언어별 독립 분류 (cross-lingual merge 제거) ===\n")
+    print(f"분류 언어: {args.lang}")
+    print(f"HDBSCAN 토픽 선택: {CLUSTER_SELECTION_METHOD}")
+    print(f"라벨링: 클러스터링 단계에서는 키워드 임시 라벨만 — GPT 라벨은 --label-only 로 별도 실행")
+    if MERGE_SIMILAR_TOPICS:
+        print(f"동일 언어 유사 토픽 병합(B): ON (sim≥{MERGE_SIMILAR_THRESHOLD})")
+
+    articles = load_news(langs=langs)
     dist = Counter(a["attr"] for a in articles)
     print(f"전체: {len(articles)}건")
     for attr, cnt in dist.most_common():
@@ -831,17 +1218,18 @@ def main():
     for attr in ATTRS_KR:
         if attr not in target:
             continue
-        res = process_attr(articles, attr, sbert, skip_gpt_label=args.no_label)
+        # 클러스터링 단계는 항상 GPT 라벨 스킵(키워드 임시 라벨). GPT 라벨은 --label-only.
+        res = process_attr(articles, attr, sbert, skip_gpt_label=True)
         if res:
             results[attr] = res
 
     # ── DuckDB: article→topic 매핑 저장 ──
     write_assignments_to_db(results)
 
-    # JSON에는 assignments(대량) 빼고 저장
+    # JSON에는 assignments(대량) 빼고 저장. 대표문서는 유지 → --label-only 가 사용.
     for d in results.values():
         d.pop("assignments", None)
-    clean_for_save(results)
+    clean_for_save(results, keep_repr=True)
 
     with open(OUTPUT, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
