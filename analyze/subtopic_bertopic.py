@@ -33,7 +33,6 @@ load_dotenv()
 
 import _bootstrap  # noqa: F401
 import config
-from news_cleaning import STRICT_WHERE, CLEANED_CONTENT_SQL  # type: ignore[import-not-found]
 
 KR_PROMPT_VERSION = "v2_en_20260418"
 KR_BODY_CHAR_CAP  = 1500
@@ -263,13 +262,13 @@ def load_news():
             if len(text) > 20:
                 articles.append({"id":f"{source}:{aid}","text":text,"source":source,"attr":attr,"lang":lang})
 
-    # ── KR domestic news (news.duckdb) ──
-    con = duckdb.connect(config.NEWS_DB_PATH, read_only=True)
+    # ── KR domestic news (news_analysis.duckdb — Stage 1+2 적용본) ──
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH, read_only=True)
     con.execute("PRAGMA disable_progress_bar")
     kr_sql = f"""
       SELECT n.news_id,
              n.title,
-             SUBSTR(({CLEANED_CONTENT_SQL}), 1, {KR_BODY_CHAR_CAP}) AS body,
+             SUBSTR(n.content, 1, {KR_BODY_CHAR_CAP}) AS body,
              n.provider,
              c.primary_attr
       FROM news_articles n
@@ -279,7 +278,6 @@ def load_news():
        AND c.error IS NULL
        AND c.primary_attr IS NOT NULL
        AND c.primary_attr <> 'none'
-      WHERE {STRICT_WHERE}
     """
     kr_rows = con.execute(kr_sql).fetchall()
     con.close()
@@ -447,7 +445,7 @@ def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
         indices  = [i for i, t in enumerate(topics) if t == tid]
         src_dist = Counter(sources[i] for i in indices)
 
-        # 대표 문서 (센트로이드 최근접 5건) — 원본 384차원으로 계산
+        # 대표 문서 (센트로이드 최근접 5건) — 원본 임베딩 차원(1024)으로 계산
         t_emb    = embeddings[indices]
         centroid = t_emb.mean(axis=0)
         dists    = np.linalg.norm(t_emb - centroid, axis=1)
@@ -478,8 +476,8 @@ def align_topics(en_topics, ko_topics, threshold=MERGE_THRESHOLD):
     en_ids = list(en_topics.keys())
     ko_ids = list(ko_topics.keys())
 
-    en_centroids = np.stack([en_topics[i]["centroid"] for i in en_ids])  # (n_en, 384)
-    ko_centroids = np.stack([ko_topics[i]["centroid"] for i in ko_ids])  # (n_ko, 384)
+    en_centroids = np.stack([en_topics[i]["centroid"] for i in en_ids])  # (n_en, 1024)
+    ko_centroids = np.stack([ko_topics[i]["centroid"] for i in ko_ids])  # (n_ko, 1024)
 
     sim = cosine_similarity(en_centroids, ko_centroids)  # (n_en, n_ko)
 
@@ -715,7 +713,7 @@ def process_attr(articles, attr, sbert, *, skip_gpt_label=False):
 ASSIGNMENT_TABLE = "subtopic_assignments"
 
 def write_assignments_to_db(results):
-    """Append per-article subtopic assignment to ANALYSIS_DB.
+    """Append per-article subtopic assignment to NEWS_ANALYSIS_DB.
 
     Schema:
       attr           VARCHAR     -- e.g. '책임/윤리AI'
@@ -736,7 +734,7 @@ def write_assignments_to_db(results):
     if not rows:
         print("  [DB] no assignments to write")
         return
-    con = duckdb.connect(config.ANALYSIS_DB_PATH)
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH)
     con.execute(f"""
         CREATE TABLE IF NOT EXISTS {ASSIGNMENT_TABLE} (
             attr           VARCHAR,

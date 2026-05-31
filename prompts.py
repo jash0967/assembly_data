@@ -117,7 +117,7 @@ Classify primary as "none" if any of the following apply:
 - Product launch / corporate announcement without policy angle
 - Stock analysis or financial reporting without regulatory context
 - Technical research or benchmark results without policy implications
-- AI mentioned only as a tool; article's real subject is elsewhere (e.g., medical study, entertainment review)
+- Avian influenza or other wildlife related topics without any connection to artificial intelligence
 - Pure how-to or user tutorial
 
 ## Output Format

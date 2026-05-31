@@ -1,7 +1,10 @@
-"""Batch API classifier for Korean domestic news (Strict-filtered).
+"""Batch API classifier for Korean domestic news.
 
 Async sibling of classify_news_kr.py. Uses OpenAI Batch API → 50% input/output discount.
 24h SLA, suitable for production runs (≥1000 rows). Use the sync script for smoke tests.
+
+Input  : data/news/news_analysis.duckdb, news_articles (Stage 1+2 적용본)
+Output : data/news/news_analysis.duckdb, news_classifications (+ cleaning_version)
 
 Workflow (분리된 commands; idempotent · resume 가능):
   submit   build JSONL from todo rows, chunk into ≤150 MB files, upload, create batches
@@ -14,11 +17,11 @@ State file: data/news/batch_state.json — preserves batch_id list across script
 Restart-safe: state lives outside the process so polling can resume after Ctrl-C.
 
 Usage:
-  venv/Scripts/python.exe analyze/classify_news_kr_batch.py submit
-  venv/Scripts/python.exe analyze/classify_news_kr_batch.py status
-  venv/Scripts/python.exe analyze/classify_news_kr_batch.py collect
-  venv/Scripts/python.exe analyze/classify_news_kr_batch.py full
-  venv/Scripts/python.exe analyze/classify_news_kr_batch.py submit --limit 200  # half-test
+  python analyze/classify_news_kr_batch.py submit
+  python analyze/classify_news_kr_batch.py status
+  python analyze/classify_news_kr_batch.py collect
+  python analyze/classify_news_kr_batch.py full
+  python analyze/classify_news_kr_batch.py submit --limit 200  # half-test
 """
 from __future__ import annotations
 
@@ -41,7 +44,6 @@ import _bootstrap  # noqa: F401
 
 import config
 from prompts import SYSTEM_PROMPT
-from news_cleaning import STRICT_WHERE  # type: ignore[import-not-found]
 
 load_dotenv()
 client = OpenAI()
@@ -73,19 +75,61 @@ def _now() -> str:
 
 
 # ─────────────────────────── DB helpers ───────────────────────────
+_CLASSIFICATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS news_classifications (
+    news_id          VARCHAR NOT NULL,
+    prompt_version   VARCHAR NOT NULL,
+    primary_attr     VARCHAR,
+    secondary_attr   VARCHAR,
+    tertiary_attr    VARCHAR,
+    classified_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    error            VARCHAR,
+    cleaning_version VARCHAR NOT NULL,
+    PRIMARY KEY (news_id, prompt_version)
+)
+"""
+
+_PROMPT_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS news_prompt_versions (
+    version    VARCHAR PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes      VARCHAR
+)
+"""
+
+
+def _ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
+    """classify 스크립트가 분류 테이블의 소유자 — cleaning은 안 만든다."""
+    con.execute(_CLASSIFICATIONS_DDL)
+    con.execute(_PROMPT_VERSIONS_DDL)
+    con.execute(
+        "INSERT OR IGNORE INTO news_prompt_versions (version, notes) VALUES (?, ?)",
+        [PROMPT_VERSION, "auto-registered by classify_news_kr_batch.py"],
+    )
+
+
+def _active_cleaning_version(con: duckdb.DuckDBPyConnection) -> str:
+    """news_cleaning_runs의 가장 최근 활성 버전."""
+    r = con.execute("""
+        SELECT cleaning_version FROM news_cleaning_runs
+        ORDER BY built_at DESC LIMIT 1
+    """).fetchone()
+    if r is None:
+        raise SystemExit(
+            "news_cleaning_runs에 활성 cleaning_version이 없습니다. "
+            "먼저 python analyze/news_cleaning.py 를 실행하세요."
+        )
+    return r[0]
+
+
 def fetch_todo(limit: int | None) -> list[tuple[str, str, str]]:
-    """Strict-pass rows not yet successfully classified at current prompt_version."""
-    con = duckdb.connect(config.NEWS_DB_PATH, read_only=True)
+    """Stage 1+2 적용된 행 중 현재 prompt_version에서 미분류된 것만."""
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH)
     con.execute("PRAGMA disable_progress_bar")
+    _ensure_tables(con)
     sql = f"""
-      WITH strict_pass AS (
-        SELECT news_id, title,
-               REPLACE(REPLACE(content, '(AI학습 포함)', ''), '(AI 학습 포함)', '')
-                 AS content
-        FROM news_articles WHERE {STRICT_WHERE}
-      )
       SELECT s.news_id, s.title, SUBSTR(s.content, 1, {BODY_CHAR_CAP})
-      FROM strict_pass s
+      FROM news_articles s
       LEFT JOIN news_classifications c
         ON c.news_id = s.news_id
        AND c.prompt_version = '{PROMPT_VERSION}'
@@ -103,19 +147,22 @@ def fetch_todo(limit: int | None) -> list[tuple[str, str, str]]:
 def insert_rows(rows: list[dict]) -> None:
     if not rows:
         return
-    con = duckdb.connect(config.NEWS_DB_PATH)
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH)
     con.execute("PRAGMA disable_progress_bar")
+    _ensure_tables(con)
+    cleaning_v = _active_cleaning_version(con)
     con.executemany(
         """
         INSERT OR REPLACE INTO news_classifications
-          (news_id, prompt_version, primary_attr, secondary_attr, tertiary_attr, error)
-        VALUES (?, ?, ?, ?, ?, ?)
+          (news_id, prompt_version, primary_attr, secondary_attr, tertiary_attr, error, cleaning_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
                 r["news_id"], PROMPT_VERSION,
                 r.get("primary_attr"), r.get("secondary_attr"),
                 r.get("tertiary_attr"), r.get("error"),
+                cleaning_v,
             )
             for r in rows
         ],

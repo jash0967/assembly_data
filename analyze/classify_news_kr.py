@@ -1,17 +1,19 @@
-"""GPT 10-attribute classification for Korean domestic news (Strict-filtered).
+"""GPT 10-attribute classification for Korean domestic news.
 
 Companion to classify_articles.py (Guardian / NYT) and classify_bills.py.
 Uses prompts.SYSTEM_PROMPT (Carvao v2 EN) so labels are cross-source comparable.
 
-Input  : data/news/news.duckdb, news_articles WHERE STRICT_WHERE  (~94,029 rows)
-Output : data/news/news.duckdb, news_classifications table
+Input  : data/news/news_analysis.duckdb, news_articles
+         (Stage 1+2 적용본 — Rule B1·B2 정화된 content, Stage 2 통과 행만)
+Output : data/news/news_analysis.duckdb, news_classifications table
          PK = (news_id, prompt_version='v2_en_20260418')
+         cleaning_version 컬럼 = news_cleaning_runs의 가장 최근 활성 버전
 
 Usage:
-  venv/Scripts/python.exe analyze/classify_news_kr.py
-  venv/Scripts/python.exe analyze/classify_news_kr.py --limit 50      # smoke test
-  venv/Scripts/python.exe analyze/classify_news_kr.py --workers 30
-  venv/Scripts/python.exe analyze/classify_news_kr.py --force         # drop + reclassify all
+  python analyze/classify_news_kr.py
+  python analyze/classify_news_kr.py --limit 50      # smoke test
+  python analyze/classify_news_kr.py --workers 30
+  python analyze/classify_news_kr.py --force         # drop + reclassify all
 
 Calibrated for OpenAI Tier 3 (gpt-4.1-mini: 5K RPM / 4M TPM).
 Default workers=30 → ~3K-6K RPM effective with built-in retry on 429.
@@ -38,7 +40,6 @@ import _bootstrap  # noqa: F401
 
 import config
 from prompts import SYSTEM_PROMPT
-from news_cleaning import STRICT_WHERE  # type: ignore[import-not-found]
 
 load_dotenv()
 client = OpenAI()
@@ -52,18 +53,71 @@ BODY_CHAR_CAP = 30000
 # Shared write connection — DuckDB serialises writes per process
 _db_lock = threading.Lock()
 _db_con: duckdb.DuckDBPyConnection | None = None
+_active_cleaning_version: str | None = None
+
+
+_CLASSIFICATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS news_classifications (
+    news_id          VARCHAR NOT NULL,
+    prompt_version   VARCHAR NOT NULL,
+    primary_attr     VARCHAR,
+    secondary_attr   VARCHAR,
+    tertiary_attr    VARCHAR,
+    classified_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    error            VARCHAR,
+    cleaning_version VARCHAR NOT NULL,
+    PRIMARY KEY (news_id, prompt_version)
+)
+"""
+
+_PROMPT_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS news_prompt_versions (
+    version    VARCHAR PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes      VARCHAR
+)
+"""
 
 
 def _open_db() -> duckdb.DuckDBPyConnection:
     global _db_con
     if _db_con is None:
-        _db_con = duckdb.connect(config.NEWS_DB_PATH)
+        _db_con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH)
         _db_con.execute("PRAGMA disable_progress_bar")
+        # classify가 분류 테이블의 소유자 — cleaning은 안 만든다.
+        _db_con.execute(_CLASSIFICATIONS_DDL)
+        _db_con.execute(_PROMPT_VERSIONS_DDL)
+        _db_con.execute(
+            "INSERT OR IGNORE INTO news_prompt_versions (version, notes) VALUES (?, ?)",
+            [PROMPT_VERSION, "auto-registered by classify_news_kr.py"],
+        )
     return _db_con
 
 
+def active_cleaning_version() -> str:
+    """news_cleaning_runs의 가장 최근 활성 버전. 한 번 캐시."""
+    global _active_cleaning_version
+    if _active_cleaning_version is None:
+        con = _open_db()
+        r = con.execute("""
+            SELECT cleaning_version FROM news_cleaning_runs
+            ORDER BY built_at DESC LIMIT 1
+        """).fetchone()
+        if r is None:
+            raise SystemExit(
+                "news_cleaning_runs에 활성 cleaning_version이 없습니다. "
+                "먼저 python analyze/news_cleaning.py 를 실행하세요."
+            )
+        _active_cleaning_version = r[0]
+    return _active_cleaning_version
+
+
 def fetch_todo(force: bool, limit: int | None) -> list[tuple[str, str, str]]:
-    """Return [(news_id, title, content_clipped)] for rows needing classification."""
+    """Return [(news_id, title, content_clipped)] for rows needing classification.
+
+    Reads from news_analysis.duckdb where news_articles.content is already
+    Stage 1 sanitized (Rule B1·B2 applied at build time).
+    """
     con = _open_db()
     if force:
         with _db_lock:
@@ -74,16 +128,8 @@ def fetch_todo(force: bool, limit: int | None) -> list[tuple[str, str, str]]:
             print("--force: dropped all rows at current prompt_version", flush=True)
 
     sql = f"""
-        WITH strict_pass AS (
-          SELECT news_id, title,
-                 -- Strip MBC boilerplate for cleaner GPT input (mirrors STRICT_WHERE)
-                 REPLACE(REPLACE(content, '(AI학습 포함)', ''), '(AI 학습 포함)', '')
-                   AS content
-          FROM news_articles
-          WHERE {STRICT_WHERE}
-        )
         SELECT s.news_id, s.title, SUBSTR(s.content, 1, {BODY_CHAR_CAP})
-        FROM strict_pass s
+        FROM news_articles s
         LEFT JOIN news_classifications c
           ON c.news_id = s.news_id
          AND c.prompt_version = '{PROMPT_VERSION}'
@@ -143,12 +189,13 @@ def insert_batch(rows: list[dict]) -> None:
     if not rows:
         return
     con = _open_db()
+    cleaning_v = active_cleaning_version()
     with _db_lock:
         con.executemany(
             """
             INSERT OR REPLACE INTO news_classifications
-              (news_id, prompt_version, primary_attr, secondary_attr, tertiary_attr, error)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (news_id, prompt_version, primary_attr, secondary_attr, tertiary_attr, error, cleaning_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -158,6 +205,7 @@ def insert_batch(rows: list[dict]) -> None:
                     r["secondary_attr"],
                     r["tertiary_attr"],
                     r["error"],
+                    cleaning_v,
                 )
                 for r in rows
             ],

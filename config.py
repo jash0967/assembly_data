@@ -7,10 +7,11 @@ load_dotenv()
 ASSEMBLY_API_KEY = os.environ.get("ASSEMBLY_API_KEY", "")
 BASE_URL = "https://open.assembly.go.kr/portal/openapi"
 PAGE_SIZE = 1000
-_ROOT       = os.path.dirname(__file__)
-_DATA_DIR   = os.path.join(_ROOT, "data")     # 정본 원본·DB만
-_OUTPUT_DIR = os.path.join(_ROOT, "output")   # 파이프라인 산출물
-_CACHE_DIR  = os.path.join(_ROOT, ".cache")    # 재생성 가능한 캐시, gitignored
+_ROOT        = os.path.dirname(__file__)
+_DATA_DIR    = os.path.join(_ROOT, "data")     # 정본 원본·DB만
+_OUTPUT_DIR  = os.path.join(_ROOT, "output")   # 정본 파이프라인(analyze/·collect/·figures/) 산출물 전용
+_WORKING_DIR = os.path.join(_ROOT, "working")  # 시험 스크립트(working/*.py) + 그 산출물
+_CACHE_DIR   = os.path.join(_ROOT, ".cache")   # 재생성 가능한 캐시, gitignored
 
 # 정본 데이터 (수집 원본 + DuckDB)
 BILLS_KR_DIR = os.path.join(_DATA_DIR, "bills_kr")   # KR Open API: bills + docs + speeches
@@ -18,20 +19,30 @@ BILLS_US_DIR = os.path.join(_DATA_DIR, "bills_us")   # US Congress 118/119
 BILLS_EU_DIR = os.path.join(_DATA_DIR, "bills_eu")   # EU AI Act + amendments
 NEWS_DIR     = os.path.join(_DATA_DIR, "news")       # KR/NYT/Guardian news
 
-# 파이프라인 산출물 (output/)
+# 정본 파이프라인 산출물 (output/) — analyze/·collect/·figures/ 가 만드는 결과만
+OUTPUT_DIR      = _OUTPUT_DIR                              # output 루트 (최종 분석 마크다운 거주지)
 ANALYSIS_DIR    = os.path.join(_OUTPUT_DIR, "analysis")    # JSON outputs (classifications, topics)
 EXPORTS_DIR     = os.path.join(_OUTPUT_DIR, "exports")     # Human-readable markdown
-STABILITY_DIR   = os.path.join(_OUTPUT_DIR, "stability")   # BERTopic 안정성 실험 (npy + JSON)
 FIGURES_OUT_DIR = os.path.join(_OUTPUT_DIR, "figures")     # plotly/matplotlib 시각화 산출
+FIGURES_SOURCE_DIR = os.path.join(FIGURES_OUT_DIR, "source")  # 출판사 인계용 그림 원자료 (CSV)
+
+# 시험 산출물 (working/) — working/*.py 가 만드는 결과
+WORKING_DIR    = _WORKING_DIR
+STABILITY_DIR  = os.path.join(_WORKING_DIR, "stability")   # BERTopic 안정성 실험 npy/JSON
 
 # 캐시 (재생성 가능, .gitignore에 등재)
 CACHE_DIR              = _CACHE_DIR
 BERTOPIC_EMBED_CACHE   = os.path.join(_CACHE_DIR, "bertopic_embeddings")
+# matplotlib 한글 폰트 (시스템 미설치 시 figure 렌더 fallback). 마운트/시스템에서
+# 자동 복사되는 재생성 가능 자산 — analyze/news_descriptive._setup_korean_font() 참조.
+KO_FONT_PATH           = os.path.join(_CACHE_DIR, "fonts", "NanumGothic.ttf")
 
 # DB paths
 RAW_DB_PATH      = os.path.join(BILLS_KR_DIR, "assembly_raw.duckdb")
 ANALYSIS_DB_PATH = os.path.join(BILLS_KR_DIR, "assembly_analysis.duckdb")
-NEWS_DB_PATH     = os.path.join(NEWS_DIR,     "news.duckdb")
+NEWS_DB_PATH          = os.path.join(NEWS_DIR, "news.duckdb")            # raw 도메스틱 뉴스 (157k)
+NEWS_ANALYSIS_DB_PATH = os.path.join(NEWS_DIR, "news_analysis.duckdb")   # Stage 1+2 적용 + classifications + cleaning_runs
+NEWS_RAW_DB_PATH      = NEWS_DB_PATH                                      # 가독성용 explicit alias
 # Deprecated alias: legacy code paths still importing config.DB_PATH default to
 # the analysis DB (which ATTACHes raw read-only). New code should pick
 # RAW_DB_PATH or ANALYSIS_DB_PATH explicitly.

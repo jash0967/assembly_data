@@ -79,33 +79,64 @@ import json
 import duckdb
 from mcp.server.fastmcp import FastMCP
 
-_BILLS_KR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bills_kr")
-RAW_DB_PATH = os.path.join(_BILLS_KR_DIR, "assembly_raw.duckdb")
-ANALYSIS_DB_PATH = os.path.join(_BILLS_KR_DIR, "assembly_analysis.duckdb")
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_BILLS_KR_DIR = os.path.join(_REPO_ROOT, "data", "bills_kr")
+_NEWS_DIR     = os.path.join(_REPO_ROOT, "data", "news")
+RAW_DB_PATH           = os.path.join(_BILLS_KR_DIR, "assembly_raw.duckdb")
+ANALYSIS_DB_PATH      = os.path.join(_BILLS_KR_DIR, "assembly_analysis.duckdb")
+NEWS_RAW_DB_PATH      = os.path.join(_NEWS_DIR, "news.duckdb")
+NEWS_ANALYSIS_DB_PATH = os.path.join(_NEWS_DIR, "news_analysis.duckdb")
 # 호환용 alias
 DB_PATH = ANALYSIS_DB_PATH
 
 mcp = FastMCP("assembly-db")
 
+# 카탈로그 화이트리스트 — list_tables / describe_table 검색 범위
+_CATALOGS = ("assembly_analysis", "raw", "news_analysis", "news_raw")
+
 
 def _open() -> duckdb.DuckDBPyConnection:
-    """analysis DB를 read-only로 열고 raw를 ATTACH."""
+    """analysis DB를 read-only로 열고 raw + 뉴스 두 DB를 ATTACH.
+
+    같은 process에서 _open()이 여러 번 호출될 때 storage manager가
+    "이미 등록됨" BinderException을 던지는 경우가 있으므로 attach는 idempotent.
+    """
     con = duckdb.connect(ANALYSIS_DB_PATH, read_only=True)
-    con.execute(f"ATTACH '{RAW_DB_PATH}' AS raw (READ_ONLY)")
+    for path, alias in (
+        (RAW_DB_PATH, "raw"),
+        (NEWS_ANALYSIS_DB_PATH, "news_analysis"),
+        (NEWS_RAW_DB_PATH, "news_raw"),
+    ):
+        try:
+            con.execute(f"ATTACH '{path}' AS {alias} (READ_ONLY)")
+        except duckdb.BinderException:
+            # 이미 attached (DuckDB의 같은-파일 storage manager 중복 등록 방지)
+            pass
     return con
 
 
 @mcp.tool()
 def list_tables() -> str:
-    """analysis DB와 raw DB의 모든 테이블·뷰 목록을 반환합니다."""
+    """4개 DB의 모든 테이블·뷰 목록을 반환합니다.
+
+    카탈로그:
+      - assembly_analysis : 법안 분류·필터 (main connection)
+      - raw               : Assembly 37 API + 추출 본문 (read-only ATTACH)
+      - news_analysis     : Stage 1+2 적용 뉴스 + 분류 (read-only ATTACH)
+      - news_raw          : raw 도메스틱 뉴스 157k (read-only ATTACH)
+    """
+    placeholders = ", ".join(["?"] * len(_CATALOGS))
     con = _open()
     try:
-        rows = con.execute("""
+        rows = con.execute(
+            f"""
             SELECT table_catalog, table_name, table_type
             FROM information_schema.tables
-            WHERE table_catalog IN ('assembly_analysis', 'raw')
+            WHERE table_catalog IN ({placeholders})
             ORDER BY table_catalog, table_type, table_name
-        """).fetchall()
+            """,
+            list(_CATALOGS),
+        ).fetchall()
     finally:
         con.close()
     out = []
@@ -114,7 +145,8 @@ def list_tables() -> str:
         if cat != cur_cat:
             out.append(f"\n=== {cat} ===")
             cur_cat = cat
-        prefix = f"{cat}." if cat == "raw" else ""
+        # main connection이 assembly_analysis라 그것만 무수식, 나머지는 prefix
+        prefix = f"{cat}." if cat != "assembly_analysis" else ""
         out.append(f"{'[VIEW]' if ttype == 'VIEW' else '[TABLE]'} {prefix}{name}")
     return "\n".join(out).lstrip()
 
@@ -124,9 +156,11 @@ def describe_table(table_name: str) -> str:
     """특정 테이블/뷰의 컬럼 정보와 샘플 데이터를 반환합니다.
 
     Args:
-        table_name: 테이블 또는 뷰 이름. raw 측은 'raw.<name>' 또는 무수식 모두 허용.
+        table_name: 테이블 또는 뷰 이름. 다른 카탈로그는 '<catalog>.<name>' 형식
+            (예: 'raw.v_bill', 'news_analysis.news_articles', 'news_raw.news_articles').
+            무수식이면 4개 카탈로그를 순차 검색.
     """
-    # 'raw.<name>' 또는 'main.<name>' 같은 카탈로그 접두 처리
+    # '<catalog>.<name>' 같은 카탈로그 접두 처리
     if "." in table_name:
         catalog, _, base_name = table_name.partition(".")
     else:
@@ -135,9 +169,9 @@ def describe_table(table_name: str) -> str:
 
     con = _open()
     try:
-        # 카탈로그 미지정 시 두 DB 모두에서 검색 (analysis 우선)
+        # 카탈로그 미지정 시 4개 DB에서 검색 (assembly_analysis 우선)
         if catalog is None:
-            for cat in ("assembly_analysis", "raw"):
+            for cat in _CATALOGS:
                 cols = con.execute(
                     "SELECT column_name, data_type FROM information_schema.columns "
                     "WHERE table_catalog = ? AND table_name = ? ORDER BY ordinal_position",
@@ -155,12 +189,17 @@ def describe_table(table_name: str) -> str:
         if not cols:
             return f"테이블 '{table_name}'을 찾을 수 없습니다."
 
-        qualified = f'{catalog}."{base_name}"' if catalog == "raw" else f'"{base_name}"'
+        # main connection은 assembly_analysis라 그것만 무수식, 나머지는 catalog 접두
+        qualified = (
+            f'"{base_name}"'
+            if catalog == "assembly_analysis"
+            else f'{catalog}."{base_name}"'
+        )
         count = con.execute(f'SELECT COUNT(*) FROM {qualified}').fetchone()[0]
         sample = con.execute(f'SELECT * FROM {qualified} LIMIT 3').fetchall()
         col_names = [c[0] for c in cols]
 
-        prefix = "raw." if catalog == "raw" else ""
+        prefix = f"{catalog}." if catalog != "assembly_analysis" else ""
         result = f"=== {prefix}{base_name} ({count:,}건) ===\n\n"
         result += "컬럼:\n"
         for cname, ctype in cols:

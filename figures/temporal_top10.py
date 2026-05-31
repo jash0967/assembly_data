@@ -4,8 +4,8 @@ Bump chart (Plotly) — 분기별 top-10 랭킹 변화 + 진입/탈락 마커.
 Lifespan bar (matplotlib) — 각 토픽이 top-10에 머문 기간 가로 막대.
 
 입력:
-  - assembly_analysis.duckdb :: subtopic_assignments  (article→topic 매핑, 최신 run)
-  - data/analysis/subtopics_bertopic.json             (토픽 키워드/라벨)
+  - news_analysis.duckdb :: subtopic_assignments      (article→topic 매핑, 최신 run)
+  - output/analysis/subtopics_bertopic.json           (토픽 키워드/라벨)
   - news.duckdb :: news_articles                      (KR 기사 시간)
   - data/news/{guardian,nyt}_articles_raw.json        (영문 기사 시간)
 
@@ -51,7 +51,7 @@ MIN_QUARTERS_FOR_DISPLAY = 1            # 한 토픽이 top10 진입한 최소 �
 # 1. 데이터 로딩
 # ───────────────────────────────────────────────────────────────
 def load_assignments():
-    con = duckdb.connect(config.ANALYSIS_DB_PATH, read_only=True)
+    con = duckdb.connect(config.NEWS_ANALYSIS_DB_PATH, read_only=True)
     df = con.execute("""
         SELECT attr, article_id, source, lang, topic_id
         FROM subtopic_assignments

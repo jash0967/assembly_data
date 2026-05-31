@@ -17,7 +17,7 @@ Two distinct but related workstreams share this repo:
 | File | Role |
 |------|------|
 | [prompts.py](prompts.py) | Single source of truth for the 10-attribute `SYSTEM_PROMPT`. Used by both classifiers. |
-| [analyze/classify_articles.py](analyze/classify_articles.py) | News classifier (영문 소스: Guardian, NYT). Usage: `python analyze/classify_articles.py guardian`, `nyt`, or `all`. 한국 도메스틱 뉴스는 `data/news/news.duckdb` (별도 파이프라인). |
+| [analyze/classify_articles.py](analyze/classify_articles.py) | News classifier (영문 소스: Guardian, NYT). Usage: `python analyze/classify_articles.py guardian`, `nyt`, or `all`. 한국 도메스틱 뉴스는 `data/news/news_analysis.duckdb` (별도 파이프라인 — [analyze/news_cleaning.py](analyze/news_cleaning.py) + [analyze/classify_news_kr*.py](analyze/classify_news_kr.py)). |
 | [analyze/classify_bills.py](analyze/classify_bills.py) | Bill classifier. Usage: `python analyze/classify_bills.py {kr_19|kr_20|kr_21|kr_22|us_118|us_119|eu_act|eu_amendments|all}`. |
 | [bill_loaders.py](bill_loaders.py) | Loader helpers `load_kr_bills()`, `load_us_bills()`, `load_eu_bills()` that join classification with source metadata. All downstream consumers (figures, reports, validators) go through this module — do not re-load `bills_classified_*.json` directly. |
 | [collect/download_bills.py](collect/download_bills.py) | KR bill PDF downloader + fitz text extraction → `bill_text` table. Usage: `python collect/download_bills.py --age 22`. |
@@ -88,16 +88,22 @@ Two distinct news layers since 2026-05-21:
 
 1. **Foreign (Guardian / NYT)** — JSON on disk under `data/news/*.json`, classified with the unified 10-attribute prompt via `classify_articles.py` → `data/analysis/articles_classified_{guardian,nyt}.json`. Title filter (must contain `\bAI\b | artificial intelligence | A\.I\.`) is enforced in `classify_articles.py::title_has_kw` so cross-source comparison stays apples-to-apples.
 
-2. **Domestic Korean (KBS, MBC, SBS, YTN, 중앙일보, 한겨레)** — 157,886 articles (2018~2026) consolidated into `data/news/news.duckdb` (`news_articles` table, PK = `news_id`). Source JSONs archived under `data/news/raw_news_archive/` (gitignored). The earlier Naver Search API pipeline was retired with this dataset.
+2. **Domestic Korean (KBS, MBC, SBS, YTN, 중앙일보, 한겨레)** — 157,886 articles (2018~2026) raw가 `data/news/news.duckdb`에, 2단계 정화·필터 후 81,121 articles + 분류 결과가 `data/news/news_analysis.duckdb`에 거주 (2026-05-28 분리). Source JSONs archived under `data/news/raw_news_archive/` (gitignored). The earlier Naver Search API pipeline was retired with this dataset.
 
-### 한국 도메스틱 뉴스 Strict AI 필터
+### 한국 도메스틱 뉴스 정화 파이프라인 — 2단계 (since 2026-05-28)
 
-한국 도메스틱 뉴스는 4규칙 Strict 필터로 정제 후 10속성 분류 → `news.duckdb::news_classifications` (PK `news_id × prompt_version`).
+raw `news.duckdb` → `news_analysis.duckdb` 빌드 시 두 단계가 한 SQL 안에서 합성:
 
-- **필터 정의**: [analyze/news_cleaning.py](analyze/news_cleaning.py) — `STRICT_WHERE` SQL export
+- **Stage 1 (Boilerplate Removal)** — 본문 정화 (행 보존). Rule B1 (YTN footer 라인 제거), Rule B2 (MBC `(AI학습 포함)` substring 제거)
+- **Stage 2 (AI Relevance Filter)** — 행 단위 통과/탈락. Rule R1 (AI 키워드 매칭, sanitized content + raw title), R2 (영문 본문 제외), R3 (조류인플루엔자 약자 충돌), R4 (사이버대학 광고), R5 (일반대 모집 광고 footer 3중 조합). 결과 81,121건.
+
+분류 결과는 `news_analysis.duckdb::news_classifications` (PK `news_id × prompt_version`, 추가 컬럼 `cleaning_version` — 어느 룰 위에서 만들어진 분류인지 추적).
+
+- **룰 정의 + 빌드 + CLI**: [analyze/news_cleaning.py](analyze/news_cleaning.py) — 두 단계 SQL 식(`SANITIZE_CONTENT_SQL`, `RELEVANCE_WHERE`) export + 빌드 entry point. `python analyze/news_cleaning.py [--force|--dry-run|--stage1-only]`
+- **빌드 메타·히스토리**: `news_analysis.duckdb::news_cleaning_runs` (cleaning_version, rules_applied, sanitize/relevance hash, git SHA 누적)
 - **규칙·근거·매체별 통계**: [analyze/news_cleaning.md](analyze/news_cleaning.md)
 - **실행 흐름**: [WORKFLOW.md §3.5](WORKFLOW.md)
-- **분류 스크립트**: [analyze/classify_news_kr.py](analyze/classify_news_kr.py) (sync) / [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) (Batch API, 50% 할인)
+- **분류 스크립트**: [analyze/classify_news_kr.py](analyze/classify_news_kr.py) (sync) / [analyze/classify_news_kr_batch.py](analyze/classify_news_kr_batch.py) (Batch API, 50% 할인). 둘 다 `news_analysis.duckdb`에서 읽고 씀.
 
 추가 자료:
 
@@ -112,11 +118,14 @@ The data lives in **two DuckDB files** under `data/bills_kr/`:
 - `data/bills_kr/assembly_raw.duckdb` — 37 API tables + extracted text (`bill_text`, `document_text`, `speeches`) + 9 thin wrapper views (`v_bill`, `v_member`, etc.). Written by `collect/*` scripts only.
 - `data/bills_kr/assembly_analysis.duckdb` — `bill_classifications`, `bill_ai_filter`, `prompt_versions`, `speech_issues` + 2 cross-DB views (`v_kr_bills_analysis`, `v_bill_classifications_current`). Written by `classify_bills.py`.
 
-Domestic Korean news lives in a third DB: `data/news/news.duckdb` (single `news_articles` table). Not attached to the analysis/raw split — open it standalone or attach explicitly.
+Domestic Korean news is **also split** since 2026-05-28:
 
-The MCP server at [duckdb_mcp_server.py](duckdb_mcp_server.py) opens analysis as the main DB and ATTACHes raw read-only as `raw`. From the user's side: analysis tables/views are unqualified, raw tables/views are referenced as `raw.<name>` (e.g. `raw.v_bill`, `raw.bill_text`). All `bill_loaders.py` and `classify_bills.py` connections follow the same pattern. Tables use cryptic API codes (e.g. `raw.nwvrqwxyaytdsfvhu` for member info) — [CODEBOOK.md](CODEBOOK.md) maps all 37 tables to human-readable descriptions. Prefer the `v_*` views for analysis.
+- `data/news/news.duckdb` — raw 157,886 articles in `news_articles`. Written by `collect/build_news_db.py` only.
+- `data/news/news_analysis.duckdb` — Stage 1·2 적용본 + 분류 + 빌드 메타. Tables: `news_articles` (81,121, content는 Stage 1 적용본), `news_classifications` (+ `cleaning_version` 컬럼), `news_prompt_versions`, `news_cleaning_runs`. Written by `analyze/news_cleaning.py` and `analyze/classify_news_kr*.py`.
 
-`config.RAW_DB_PATH` and `config.ANALYSIS_DB_PATH` are the canonical paths. `config.DB_PATH` remains as an alias to `ANALYSIS_DB_PATH` for legacy code.
+The MCP server at [duckdb_mcp_server.py](duckdb_mcp_server.py) opens `assembly_analysis.duckdb` as the main DB and ATTACHes **3 more DBs read-only**: `raw` (assembly_raw.duckdb), `news_analysis` (news_analysis.duckdb), `news_raw` (news.duckdb). From the user's side: assembly_analysis tables/views are unqualified, others are referenced with explicit prefix — `raw.v_bill`, `news_analysis.news_articles`, `news_raw.news_articles`. Assembly raw tables use cryptic API codes (e.g. `raw.nwvrqwxyaytdsfvhu`) — [CODEBOOK.md](CODEBOOK.md) maps all 37 tables to human-readable descriptions. Prefer the `v_*` views for analysis.
+
+`config.RAW_DB_PATH` and `config.ANALYSIS_DB_PATH` are the canonical Assembly paths. `config.NEWS_DB_PATH` (= `NEWS_RAW_DB_PATH`) and `config.NEWS_ANALYSIS_DB_PATH` are the canonical news paths. `config.DB_PATH` remains as an alias to `ANALYSIS_DB_PATH` for legacy code.
 
 Every per-age table now has a standardized `age INTEGER` column; the per-API derivation rule lives in `config.py::ApiSpec.age_source` and is enforced post-collection by [collect/validate_collection.py](collect/validate_collection.py) (called automatically at the end of `collect/download_all.py`). When making schema-touching changes to the collector, run the validator before committing.
 
@@ -134,7 +143,11 @@ python collect/validate_collection.py         # post-collect drift check
 # AI pipeline — news (analyze/ 폴더)
 python analyze/classify_articles.py all                # Guardian + NYT
 python analyze/export_titles.py all                    # group titles by attribute
-python collect/build_news_db.py                        # (re)build data/news/news.duckdb from raw_news_archive/
+python collect/build_news_db.py                        # (re)build raw data/news/news.duckdb from raw_news_archive/
+python analyze/news_cleaning.py                        # raw → news_analysis.duckdb (Stage 1+2 적용 + 81k classifications 이주)
+python analyze/news_cleaning.py --stage1-only          # Stage 1 영향만 측정 (DB 변경 없음)
+python analyze/classify_news_kr.py                     # sync 분류 (소규모, smoke test)
+python analyze/classify_news_kr_batch.py submit        # Batch API 분류 (production, 50% 할인)
 
 # AI pipeline — bills (analyze/ 폴더)
 python analyze/classify_bills.py kr_22                 # single KR Congress (Stage 1+2 auto)
@@ -172,7 +185,7 @@ data/
 ├── bills_kr/   assembly_raw.duckdb, assembly_analysis.duckdb, pdf_archives/{19..22}/, docs/
 ├── bills_us/   congress.duckdb (+ on-disk JSON via replicate_carvao/data/)
 ├── bills_eu/   eu_ai_act_*.{html,json}, eu_amendments_*.{html,json}
-├── news/       news.duckdb (KR domestic), nyt_*.json, guardian_*.json, nyt_archive/, raw_news_archive/ (gitignored)
+├── news/       news.duckdb (KR raw 157k), news_analysis.duckdb (Stage 1+2 적용본 81k + classifications + cleaning_runs), nyt_*.json, guardian_*.json, nyt_archive/, raw_news_archive/ (gitignored)
 ├── analysis/   articles_classified_{guardian,nyt}.json, subtopics_*.json, treemap_*.json, etc.
 ├── exports/    bills_{kr,us,eu}_*.md, titles_*.md (human-readable)
 ├── _archive/   legacy txt/, pdf/, minutes_txt/, bill_txt_*/  (do not read; use DB)
