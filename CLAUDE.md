@@ -163,12 +163,12 @@ No test suite, linter, or CI — this is a research/analysis repo.
 ## Repository layout
 
 - **Root** — shared infrastructure & public API: shared config (`config.py`), classification prompt (`prompts.py`), data gateway (`bill_loaders.py`), MCP server (`duckdb_mcp_server.py`).
-- **[analyze/](analyze/)** — analysis-side scripts: classifiers (`classify_*.py`), exporters (`export_*.py`), subtopic NLP (`subtopic_*.py`), `compare_models.py`. Scripts here use `import _bootstrap` to find root modules (`config`, `prompts`, `bill_loaders`).
+- **[analyze/](analyze/)** — analysis-side scripts: classifiers (`classify_*.py`), exporters (`export_*.py`), subtopic NLP (`subtopic_*.py`), 뉴스 데이터/리포트 백본 (`news_descriptive.py`), 보고서 그림 정본 생성기 (`make_figures.py`), `compare_models.py`. Scripts here use `import _bootstrap` to find root modules (`config`, `prompts`, `bill_loaders`).
 - **[collect/](collect/)** — all data collection·extraction scripts (Open API, bill PDFs, document attachments, foreign legislation, news APIs). Scripts here use `import _bootstrap` (collect/_bootstrap.py) to add repo root to sys.path so `import config` works regardless of script depth.
 
   Past one-shot migrations (Phase 1~5 backfills, view creation, DB split, retired Naver collectors v1~v3) are not kept on disk. Recover via `git log --all -- collect/` or `collect/_legacy/` if needed.
-- **[figures/](figures/)** — visualization regeneration (`regenerate_all.py`).
-  - `figures/_legacy/` — superseded viz scripts (`generate_figures.py`, `generate_timeline*.py`, `build_treemap*.py`, `_viz_attr_law.py`). `regenerate_all.py` is the canonical figure generator.
+- **[figures/](figures/)** — 그림 **산출물** 디렉터리 (`*.png` + `figures_data.xlsx`). 보고서가 `figures/*.png`를 고정 참조한다. 생성기는 더 이상 여기 없고 [analyze/make_figures.py](analyze/make_figures.py)가 정본 (구 `regenerate_all.py`; 데이터 갱신 후 그림이 필요하면 `python analyze/make_figures.py` 재실행).
+  - `figures/_legacy/` — superseded viz scripts (`generate_figures.py`, `generate_timeline*.py`, `build_treemap*.py`, `_viz_attr_law.py`).
 - **[replicate_carvao/](replicate_carvao/)**, **[kr_analysis/](kr_analysis/)** — frozen reference folders (see below).
 
 ## Two frozen reference folders

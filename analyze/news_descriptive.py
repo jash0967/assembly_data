@@ -1,22 +1,25 @@
-"""국내 6개 매체 AI 보도 종합 분석 — 보고서 §4.1 데이터·시각화·마크다운 백본.
+"""국내 6개 매체 AI 보도 종합 분석 — 보고서 §4.1 데이터·마크다운 백본.
 
 원래 descriptive-only 의도라 파일명이 `news_descriptive`지만, 이제 국내 언론
-AI 보도의 **전체 분석**을 한 파일에 담는다:
+AI 보도 분석의 **데이터 레이어 + 마크다운 리포트 + 출판사 인계 CSV**를 담는다:
 
     1. 보도량 시계열 (월별 추이 + 12개월 이동평균 + 이벤트 마커)
     2. AI 기본법 통과 전후 윈도우 (±24개월 매체별 월평균 변화)
     3. 정책 속성 구성 (매체별 / 연도별 — 10속성 Carvão 프레임)
     4. 키워드 추세
-    5. BERTopic 소주제 통계 — **placeholder** (별도 파이프라인 완성 후 결합)
+    5. BERTopic 소주제 통계 — **결합 대기** (소주제 재분류 진행 중, 아래 참조)
 
-산출물은 전부 config 상수 경로로 나간다:
-    - 시각화 PNG  → config.FIGURES_OUT_DIR  (output/figures/news_*.png)
-    - 최종 마크다운 → config.OUTPUT_DIR     (output/news_analysis.md)
+**그림(PNG) 생성은 이 파일이 하지 않는다 — `analyze/make_figures.py`가 전담**한다
+(이 모듈의 `load_*` 데이터 로더를 import해서 작도). 데이터를 갱신한 뒤 그림이
+필요하면 make_figures.py를 재실행한다. 이 파일의 산출물은:
+    - 마크다운 리포트   → config.OUTPUT_DIR          (output/news_analysis.md)
+    - 출판사 인계 CSV   → config.FIGURES_SOURCE_DIR   (output/figures/source/*.csv)
 
 **기준 데이터**: data/news/news_analysis.duckdb (Stage 1+2 적용 cleaned subset).
-분류는 `news_classifications`의 *현재 버전*(최신 classified_at의
-prompt_version × cleaning_version)만 본다 — 재분류가 진행 중이어도 완료분만
-반영하고, 커버리지(classified / total)를 함께 보고한다.
+수집·정화·10속성 GPT 분류는 모두 완료 (76,645건 전량 분류). 분류는
+`news_classifications`의 *현재 버전*(최신 classified_at의
+prompt_version × cleaning_version)만 보고, 커버리지(classified / total)를
+함께 보고한다. 남은 작업은 BERTopic 소주제 재분류뿐 — §5 참조.
 
 Public data functions (모두 @lru_cache, 반복 호출 안전):
     load_classification_coverage() -> dict
@@ -28,13 +31,13 @@ Public data functions (모두 @lru_cache, 반복 호출 안전):
     load_attr_by_provider()        -> (providers, attrs_en, count_matrix)
     load_attr_by_year()            -> (years, attrs_en, share_matrix)
     load_keyword_trend(keywords)   -> dict[keyword, list[(yyyymm, hits)]]
-    load_subtopic_stats()          -> None   # TODO: BERTopic 결합
+    load_subtopic_stats()          -> None   # 결합 대기: BERTopic 소주제 재분류 중
 
 CLI:
     python analyze/news_descriptive.py --summary   # 콘솔 요약
-    python analyze/news_descriptive.py --figures   # output/figures/news_*.png
-    python analyze/news_descriptive.py --report    # output/news_analysis.md
-    python analyze/news_descriptive.py --all       # figures + report
+    python analyze/news_descriptive.py --report    # output/news_analysis.md (그림 생성 안 함)
+    python analyze/news_descriptive.py --sources   # 출판사 인계 CSV만
+    # 그림 PNG가 필요하면: python analyze/make_figures.py
 """
 
 from __future__ import annotations
@@ -138,8 +141,9 @@ def _con() -> duckdb.DuckDBPyConnection:
 def _current_version() -> tuple[str, str]:
     """분류의 '현재 버전' = 최신 classified_at의 (prompt_version, cleaning_version).
 
-    재분류가 진행 중이어도 가장 최근 빌드의 완료분만 본다. 분류가 하나도 없으면
-    ('', '') 반환 (DB가 재분류 초기 상태일 수 있음)."""
+    현재 DB에는 단일 완료 버전(v2_en_*, 76,645건 전량)만 존재하지만, 향후
+    재분류로 버전이 늘어나도 가장 최근 빌드만 보도록 방어적으로 고른다. 분류가
+    하나도 없으면 ('', '') 반환."""
     con = _con()
     try:
         row = con.execute("""
@@ -172,12 +176,12 @@ def _clf_cte() -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 1. 분류 커버리지 (재분류 진행 중 상태 보고)
+# 1. 분류 커버리지 (완료 검증 — 현재 100%)
 # ──────────────────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
 def load_classification_coverage() -> dict:
-    """현재 버전 분류 커버리지. 반환:
+    """현재 버전 분류 커버리지 (현재 76,645/76,645 = 100%). 반환:
         {total_articles, classified, pct, prompt_version, cleaning_version,
          date_min, date_max}.
     """
@@ -524,15 +528,17 @@ def load_keyword_trend(
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 5. BERTopic 소주제 — PLACEHOLDER
+# 5. BERTopic 소주제 — 결합 대기 (소주제 재분류 진행 중)
 # ──────────────────────────────────────────────────────────────────────────
 
 def load_subtopic_stats():
-    """[PLACEHOLDER] BERTopic 소주제 통계.
+    """[결합 대기] BERTopic 소주제 통계.
 
-    analyze/subtopic_bertopic.py 파이프라인이 속성별 소주제·분기별 Top-10을
-    산출하면 여기서 그 결과를 읽어 (속성 × 소주제 × 시기) 통계로 결합한다.
-    현재는 미구현 — None 반환."""
+    수집·정화·10속성 분류는 완료됐고, 남은 작업은 BERTopic 소주제 재분류뿐이다.
+    analyze/subtopic_bertopic.py가 결과를 news_analysis.duckdb::subtopic_assignments
+    (attr × article_id × topic_id)에 쓰지만, 토픽 구성이 아직 확정 전이라 이 절은
+    결합을 보류한다. 소주제가 확정되면 여기서 그 테이블을 읽어 (속성 × 소주제 ×
+    시기) 통계로 결합한다. 현재는 미결합 — None 반환."""
     return None
 
 
@@ -558,203 +564,6 @@ def _month_range(start_ym: str, end_ym: str) -> list[str]:
 def kr(attr_en: str) -> str:
     """영문 속성 라벨 → 한글. 미등록은 원문 유지."""
     return ATTR_KR.get(attr_en, attr_en)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# 시각화 (matplotlib → config.FIGURES_OUT_DIR)
-# ──────────────────────────────────────────────────────────────────────────
-
-def _setup_korean_font():
-    """한글 폰트 등록. config.KO_FONT_PATH(번들/캐시) → 시스템 설치 → 마운트 순.
-    아무 것도 못 찾으면 경고만 하고 진행 (한글이 □로 보일 수 있음)."""
-    import matplotlib
-    import matplotlib.font_manager as fm
-    import matplotlib.pyplot as plt
-
-    plt.rcParams["axes.unicode_minus"] = False
-
-    # 1) 캐시/번들 폰트 파일
-    path = config.KO_FONT_PATH
-    if not os.path.exists(path):
-        # 2) WSL 마운트 등에서 한 번 자동 복사 시도 (재생성 가능 자산)
-        for cand in _discover_font_files():
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                import shutil
-                shutil.copy(cand, path)
-                break
-            except Exception:
-                continue
-    if os.path.exists(path):
-        try:
-            fm.fontManager.addfont(path)
-            plt.rcParams["font.family"] = fm.FontProperties(fname=path).get_name()
-            return
-        except Exception:
-            pass
-    # 3) 시스템 설치 폰트 이름
-    names = {f.name for f in fm.fontManager.ttflist}
-    for cand in ["NanumGothic", "Noto Sans CJK KR", "Malgun Gothic", "AppleGothic"]:
-        if cand in names:
-            plt.rcParams["font.family"] = cand
-            return
-    print("  [warn] 한글 폰트를 찾지 못함 — 그림의 한글이 깨질 수 있습니다.", flush=True)
-
-
-def _discover_font_files() -> list[str]:
-    """시스템·마운트에서 NanumGothic.ttf 후보 경로 탐색."""
-    cands = [
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/mnt/d/backup_2025/나눔 글꼴/나눔고딕/NanumFontSetup_TTF_GOTHIC/NanumGothic.ttf",
-    ]
-    return [c for c in cands if os.path.exists(c)]
-
-
-def _fig_path(name: str) -> str:
-    os.makedirs(config.FIGURES_OUT_DIR, exist_ok=True)
-    return os.path.join(config.FIGURES_OUT_DIR, name)
-
-
-def fig_decade_trend() -> str:
-    """그림5: 전체 월별 보도량 + 12개월 이동평균 + 이벤트 마커."""
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from datetime import datetime
-
-    series = load_monthly_total_ma(12)
-    xs = [datetime.strptime(m, "%Y-%m") for m, _, _ in series]
-    counts = [c for _, c, _ in series]
-    ma = [a for _, _, a in series]
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.bar(xs, counts, width=20, color="#cdd8e6", label="월별 보도량")
-    ax.plot(xs, ma, color="#1f4e79", lw=2.2, label="12개월 이동평균")
-    for label, d in EVENTS:
-        dt = datetime.strptime(d, "%Y-%m-%d")
-        ax.axvline(dt, color="#c0392b", ls="--", lw=1.2, alpha=0.8)
-        ax.text(dt, ax.get_ylim()[1] * 0.95, "  " + label, rotation=90,
-                va="top", ha="left", fontsize=9, color="#c0392b")
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_ylabel("기사 수")
-    ax.set_title("국내 6개 언론사 AI 보도 월별 추이 + 12개월 이동평균")
-    ax.legend(loc="upper left")
-    plt.tight_layout()
-    out = _fig_path("news_decade_trend.png")
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close()
-    return out
-
-
-def fig_event_window() -> str:
-    """그림6: AI 기본법 통과 ±24개월 매체별 월평균 변화율 (%)."""
-    import matplotlib.pyplot as plt
-
-    win = load_event_window(AIBASIC_DATE, 24)
-    provs = [p for p in PROVIDER_ORDER if p in win["providers"]]
-    pcts = [win["providers"][p]["pct"] for p in provs]
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    colors = ["#2e7d32" if v >= 0 else "#c62828" for v in pcts]
-    bars = ax.bar(provs, pcts, color=colors)
-    for b, v in zip(bars, pcts):
-        ax.text(b.get_x() + b.get_width() / 2, v + (3 if v >= 0 else -3),
-                f"{v:+.0f}%", ha="center",
-                va="bottom" if v >= 0 else "top", fontsize=9)
-    ov = win["overall"]["pct"]
-    ax.axhline(ov, color="#1f4e79", ls="--", lw=1.3,
-               label=f"전체 평균 {ov:+.0f}%")
-    sub = " (데이터 범위 절단 — 부분 윈도우)" if win["partial"] else ""
-    ax.set_ylabel("월평균 보도량 변화율 (%)")
-    ax.set_title(f"AI 기본법 통과({AIBASIC_DATE}) 전후 ±24개월 매체별 변화{sub}")
-    ax.legend()
-    plt.tight_layout()
-    out = _fig_path("news_event_window.png")
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close()
-    return out
-
-
-def fig_provider_attr() -> str:
-    """그림7: 매체별 정책 속성 구성 (100% 누적 막대, none 제외)."""
-    import matplotlib.pyplot as plt
-
-    providers, attrs, mat = load_attr_by_provider()
-    # none 제외 share
-    attrs_no_none = [a for a in attrs if a != "none"]
-    none_i = attrs.index("none") if "none" in attrs else None
-    shares = []  # [provider][attr]
-    for pi, _ in enumerate(providers):
-        denom = sum(mat[pi][ai] for ai, a in enumerate(attrs) if a != "none")
-        shares.append([
-            (mat[pi][attrs.index(a)] / denom * 100 if denom else 0.0)
-            for a in attrs_no_none
-        ])
-
-    fig, ax = plt.subplots(figsize=(11, 6))
-    cmap = plt.get_cmap("tab10")
-    bottoms = [0.0] * len(providers)
-    for ai, a in enumerate(attrs_no_none):
-        vals = [shares[pi][ai] for pi in range(len(providers))]
-        ax.barh(providers, vals, left=bottoms, color=cmap(ai % 10), label=kr(a))
-        bottoms = [bottoms[pi] + vals[pi] for pi in range(len(providers))]
-    ax.set_xlabel("속성 비중 (%, 미분류 제외)")
-    ax.set_xlim(0, 100)
-    ax.invert_yaxis()
-    ax.set_title("국내 6개 언론사 매체별 정책 속성 구성")
-    ax.legend(ncol=2, fontsize=8, loc="lower right")
-    plt.tight_layout()
-    out = _fig_path("news_provider_attr.png")
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close()
-    return out
-
-
-def fig_attr_year_trend() -> str:
-    """연도별 정책 속성 share 추세 (라인, none 제외 분모)."""
-    import matplotlib.pyplot as plt
-
-    years, attrs, share, _counts = load_attr_by_year()
-    fig, ax = plt.subplots(figsize=(12, 6))
-    cmap = plt.get_cmap("tab10")
-    for ai, a in enumerate(attrs):
-        ys = [share[yi][ai] for yi in range(len(years))]
-        ax.plot(years, ys, marker="o", ms=3, color=cmap(ai % 10), label=kr(a))
-    ax.set_xlabel("연도")
-    ax.set_ylabel("속성 비중 (%, 미분류 제외)")
-    ax.set_title("연도별 정책 속성 구성 추세")
-    ax.legend(ncol=2, fontsize=8)
-    plt.tight_layout()
-    out = _fig_path("news_attr_year_trend.png")
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close()
-    return out
-
-
-def fig_subtopic():
-    """[PLACEHOLDER] BERTopic 소주제 시각화 — 미구현."""
-    return None
-
-
-def generate_figures() -> list[str]:
-    """모든 figure를 config.FIGURES_OUT_DIR에 생성. 생성된 경로 리스트 반환."""
-    _setup_korean_font()
-    paths = []
-    for fn in (fig_decade_trend, fig_event_window, fig_provider_attr,
-               fig_attr_year_trend):
-        try:
-            p = fn()
-            paths.append(p)
-            print(f"  → {p}", flush=True)
-        except Exception as e:
-            print(f"  [skip] {fn.__name__}: {e}", flush=True)
-    # BERTopic placeholder
-    print("  [TODO] BERTopic 소주제 figure — 파이프라인 완성 후 추가", flush=True)
-    # 출판사 인계용 원자료 CSV는 그림과 항상 함께 생성
-    print("Figure source data (출판사 인계용):", flush=True)
-    export_figure_sources()
-    return paths
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -848,7 +657,8 @@ def _write_source_manifest(coverage: dict) -> str:
         f"- 분류 버전: {coverage['prompt_version']} / {coverage['cleaning_version']}",
     ]
     if coverage["pct"] < 99.5:
-        L.append("\n> ⚠️ 재분류 진행 중 — 속성 기반 CSV는 잠정치. 분류 완료 후 재생성 요망.")
+        # 정상 상태는 100% — 이 경고는 분류 누락 감지용 방어 가드.
+        L.append("\n> ⚠️ 분류 누락 감지 — 속성 기반 CSV는 완료분 기준 부분치. 분류 보강 후 재생성 요망.")
     L += [
         "\n## 파일 ↔ 그림\n",
         "| CSV | 그림 | 내용 |",
@@ -893,20 +703,32 @@ def export_figure_sources() -> list[str]:
 # 마크다운 리포트 (→ config.OUTPUT_DIR/news_analysis.md)
 # ──────────────────────────────────────────────────────────────────────────
 
-def build_report(with_figures: bool = True) -> str:
+_REPO_FIG_DIR = os.path.join(_ROOT, "figures")  # make_figures.py 산출 PNG 거주지
+
+
+def _fig_embed(fname: str, alt: str) -> str:
+    """make_figures.py가 만든 figures/PNG를 (존재 시) output 기준 상대경로로 임베드.
+    없으면 깨진 링크 대신 안내 문구 — 그림 생성은 별도(make_figures.py) 책임."""
+    p = os.path.join(_REPO_FIG_DIR, fname)
+    if os.path.exists(p):
+        return f"\n![{alt}]({os.path.relpath(p, config.OUTPUT_DIR)})"
+    return f"\n_(그림 `{fname}` 미생성 — `python analyze/make_figures.py` 실행)_"
+
+
+def build_report() -> str:
     """국내 언론 AI 보도 분석 마크다운을 output/news_analysis.md에 작성.
-    with_figures=True면 figure도 함께 생성하고 본문에 상대경로로 임베드."""
+
+    그림은 생성하지 않는다 — `analyze/make_figures.py` 산출(figures/report41*.png)을
+    상대경로로 참조만 한다. 출판사 인계용 원자료 CSV는 함께 생성한다."""
     cov = load_classification_coverage()
-    fig_paths = generate_figures() if with_figures else []
-    fig_rel = {os.path.basename(p): os.path.relpath(p, config.OUTPUT_DIR)
-               for p in fig_paths}
 
     L: list[str] = []
     L.append("# 국내 언론 AI 보도 분석\n")
     L.append("> 자동 생성: `python analyze/news_descriptive.py --report`. "
              "기준 데이터 `data/news/news_analysis.duckdb` (Stage 1+2 cleaned subset).\n")
-    L.append("> 본문 PNG는 참고용. 출판사 인계용 그림 **원자료 CSV**는 "
-             "`output/figures/source/`에 있다 (`README.md` 참조).\n")
+    L.append("> 본문 PNG는 `analyze/make_figures.py`가 생성(figures/)하며 참고용. "
+             "출판사 인계용 그림 **원자료 CSV**는 `output/figures/source/`에 있다 "
+             "(`README.md` 참조).\n")
 
     # 0. 데이터 커버리지
     L.append("## 0. 데이터 커버리지\n")
@@ -917,8 +739,9 @@ def build_report(with_figures: bool = True) -> str:
              f"({cov['pct']:.1f}% of total)")
     L.append(f"- 분류 버전: `{cov['prompt_version']}` / cleaning `{cov['cleaning_version']}`")
     if cov["pct"] < 99.5:
-        L.append(f"\n> ⚠️ **재분류 진행 중** — 현재 {cov['pct']:.1f}%만 분류 완료. "
-                 "속성 기반 수치는 완료분 기준 잠정치이며, 분류 종료 후 재생성 필요.")
+        # 정상 상태는 100% — 분류 누락 감지용 방어 가드.
+        L.append(f"\n> ⚠️ **분류 누락 감지** — 현재 {cov['pct']:.1f}%만 분류됨. "
+                 "속성 기반 수치는 완료분 기준 부분치이며, 분류 보강 후 재생성 필요.")
     L.append("")
 
     # 1. 보도량 추이
@@ -934,8 +757,7 @@ def build_report(with_figures: bool = True) -> str:
         first_tot = sum(mat[pi][0] for pi in range(len(provs)))
         last_tot = sum(mat[pi][-1] for pi in range(len(provs)))
         L.append(f"- 연 보도량 {first_y}년 {first_tot:,}건 → {last_y}년 {last_tot:,}건")
-    if "news_decade_trend.png" in fig_rel:
-        L.append(f"\n![월별 추이]({fig_rel['news_decade_trend.png']})")
+    L.append(_fig_embed("report41a_decade_trend.png", "월별 추이"))
     L.append("")
 
     # 2. AI 기본법 윈도우
@@ -952,8 +774,7 @@ def build_report(with_figures: bool = True) -> str:
         if p in win["providers"]:
             d = win["providers"][p]
             L.append(f"| {p} | {d['before_avg']:.0f} | {d['after_avg']:.0f} | {d['pct']:+.1f}% |")
-    if "news_event_window.png" in fig_rel:
-        L.append(f"\n![이벤트 윈도우]({fig_rel['news_event_window.png']})")
+    L.append(_fig_embed("report41b_aibasic_window.png", "이벤트 윈도우"))
     L.append("")
 
     # 3. 속성 구성
@@ -967,26 +788,29 @@ def build_report(with_figures: bool = True) -> str:
             sval = "—" if a == "none" else f"{s:.1f}%"
             L.append(f"| {kr(a)} | {c:,} | {sval} |")
         L.append("")
-        L.append("### 3.2 매체별 구성\n")
-        if "news_provider_attr.png" in fig_rel:
-            L.append(f"![매체별 속성]({fig_rel['news_provider_attr.png']})\n")
-        L.append("### 3.3 연도별 추세\n")
-        if "news_attr_year_trend.png" in fig_rel:
-            L.append(f"![연도별 추세]({fig_rel['news_attr_year_trend.png']})\n")
+        L.append("### 3.2 매체별·연도별 구성\n")
+        L.append(_fig_embed("report41c_kr_attributes.png", "매체별·연도별 속성"))
+        L.append("")
     else:
         L.append("> 분류 데이터 없음 (재분류 초기 상태).\n")
 
-    # 4. BERTopic placeholder
-    L.append("## 4. 소주제 분석 (BERTopic) — 준비 중\n")
-    L.append("> **[PLACEHOLDER]** `analyze/subtopic_bertopic.py` 파이프라인 완성 후, "
-             "속성별 소주제·분기별 Top-10 동적 랭킹을 이 절에 결합한다. "
-             "`load_subtopic_stats()` 참조.\n")
+    # 4. BERTopic — 소주제 재분류 진행 중
+    L.append("## 4. 소주제 분석 (BERTopic) — 결합 대기\n")
+    L.append("> 수집·정화·10속성 분류는 완료됐고, **남은 작업은 BERTopic 소주제 "
+             "재분류뿐이다.** `analyze/subtopic_bertopic.py`가 결과를 "
+             "`subtopic_assignments` 테이블에 쓰지만 토픽 구성이 아직 확정 전이라 "
+             "이 절은 결합을 보류한다. 확정 후 속성별 소주제·분기별 Top-10 동적 "
+             "랭킹을 결합한다. `load_subtopic_stats()` 참조.\n")
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(config.OUTPUT_DIR, "news_analysis.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
     print(f"  → {out_path}", flush=True)
+
+    # 출판사 인계용 원자료 CSV는 리포트와 함께 갱신 (그림 PNG는 make_figures.py 담당)
+    print("Figure source data (출판사 인계용):", flush=True)
+    export_figure_sources()
     return out_path
 
 
@@ -1001,7 +825,7 @@ def _print_summary() -> None:
     print(f"분류 완료:   {cov['classified']:,} ({cov['pct']:.1f}%)  "
           f"[{cov['prompt_version']} / {cov['cleaning_version']}]")
     if cov["pct"] < 99.5:
-        print("  ⚠️ 재분류 진행 중 — 속성 수치는 잠정치")
+        print("  ⚠️ 분류 누락 감지 — 속성 수치는 완료분 기준 부분치")
     print()
 
     monthly = load_monthly_counts()
@@ -1031,23 +855,19 @@ def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(description="국내 언론 AI 보도 종합 분석")
     ap.add_argument("--summary", action="store_true", help="콘솔 요약 출력")
-    ap.add_argument("--figures", action="store_true",
-                    help="output/figures/news_*.png + 원자료 CSV 생성")
     ap.add_argument("--sources", action="store_true",
-                    help="출판사 인계용 원자료 CSV만 생성 (그림 없이)")
+                    help="출판사 인계용 원자료 CSV만 생성")
     ap.add_argument("--report", action="store_true",
-                    help="output/news_analysis.md 생성 (figure + 원자료 포함)")
-    ap.add_argument("--all", action="store_true", help="--figures + --report")
+                    help="output/news_analysis.md + 원자료 CSV 생성 "
+                         "(그림 PNG는 analyze/make_figures.py가 별도 생성)")
     args = ap.parse_args()
 
     did = False
     if args.summary:
         _print_summary(); did = True
-    if args.report or args.all:
-        # build_report → generate_figures → export_figure_sources 까지 일괄
-        print("Report:"); build_report(with_figures=True); did = True
-    elif args.figures:
-        print("Figures:"); generate_figures(); did = True
+    if args.report:
+        # build_report(마크다운) → export_figure_sources(CSV). 그림 PNG는 make_figures.py.
+        print("Report:"); build_report(); did = True
     elif args.sources:
         print("Figure source data (출판사 인계용):")
         export_figure_sources(); did = True

@@ -262,9 +262,9 @@ Carvão Appendix II 기준 정본:
 ### 5.4 분석·시각화
 | 스크립트 | 역할 |
 |----------|------|
-| [figures/regenerate_all.py](figures/regenerate_all.py) | **현행 정본** 그림 일괄 재생성 (fig01~fig09 + figures_data.xlsx) |
-| `figures/_legacy/generate_timeline*.py` | 옛 시계열 그림 (regenerate_all로 통합됨) |
-| `figures/_legacy/generate_figures.py` | 옛 보고서 그림 (regenerate_all로 통합됨) |
+| [analyze/make_figures.py](analyze/make_figures.py) | **현행 정본** 그림 일괄 생성 (fig01~fig06 + report41a/b/c + figures_data.xlsx). 구 `figures/regenerate_all.py`. 법안 그림은 `bill_loaders`, 뉴스 그림(report41*·fig04·fig05)은 `news_descriptive` 데이터 로더 경유. `news_descriptive.py`로 데이터를 갱신한 뒤 그림이 필요하면 이 스크립트를 재실행 |
+| `figures/_legacy/generate_timeline*.py` | 옛 시계열 그림 (make_figures로 통합됨) |
+| `figures/_legacy/generate_figures.py` | 옛 보고서 그림 (make_figures로 통합됨) |
 | `figures/_legacy/build_treemap_*.py` | 옛 트리맵 데이터 |
 | [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 — EN/KO cross-lingual 정렬, Kiwi 명사 토큰화, cuML GPU 백엔드 (`--backend cuml`), 매핑 → `subtopic_assignments` |
 | [figures/temporal_top10.py](figures/temporal_top10.py) | 분기별 소주제 Top-10 랭킹 변동 — Bump chart(Plotly) + Lifespan Gantt(matplotlib) |
@@ -345,8 +345,9 @@ python analyze/classify_bills.py all                        # 법안 6소스 (KR
 python analyze/export_titles.py all                         # 뉴스 속성별
 python analyze/export_bills.py all                          # 법안 속성별 (KR + US + EU)
 
-# 8. 시각화 (정본)
-python figures/regenerate_all.py                            # fig01~fig09 일괄 + figures_data.xlsx
+# 8. 시각화 (정본) — news_descriptive.py로 데이터 갱신 후 실행
+python analyze/news_descriptive.py --report                 # 뉴스 데이터/리포트/CSV (그림 생성 안 함)
+python analyze/make_figures.py                              # fig01~fig06 + report41a/b/c + figures_data.xlsx
 
 # 9. BERTopic 소주제 추출 + 시계열 시각화 (분기별 Top-10 동적 랭킹)
 python analyze/subtopic_bertopic.py --backend cuml --no-label
@@ -454,6 +455,13 @@ config 상수 (`config.py`):
 
 ## 10. 작업 이력 주요 분기
 
+### 2026-05-31 — 그림 생성기 재정비 + 보고서 §4.1/§4.4 갱신
+- `news_descriptive.py` 재작성(76,645건 전량 분류본 기준)에서 누락됐던 그림 생성기를 복구·이동: `figures/regenerate_all.py` → `analyze/make_figures.py` (`import _bootstrap`, WSL 한글 폰트 자동탐색).
+- `news_descriptive.py`는 그림 생성 책임 제거 — 데이터 로더 + 마크다운 리포트 + 출판사 CSV 전담. 그림은 make_figures가 정본.
+- 폐기된 raw/strict 로더 의존 그림 블록 삭제. §4.1 그림(report41a/b/c)을 현 cleaned subset(76,645)으로 재구축, fig04를 3소스(국내·Guardian·NYT)로 확장.
+- 국내 뉴스 재분류 완료로 `fig05_discourse_legislation_gap`(KR22 입법 vs 국내 뉴스) 활성화, fig06에 한국 페어 추가(3-region).
+- 보고서 §4.1/§4.4/§3.x 뉴스 수치를 현 데이터로 전면 갱신(예: 산업정책 51.1→56.9%, ±24개월 +114.1→+122.4%).
+
 ### 2026-05-27 — 폴더 정책 정리: data / output / cache 분리
 - `data/` 는 정본 원본·DB 만 (bills_kr/us/eu, news, _archive, _audit)
 - 새 `output/` 폴더 — 파이프라인 산출물 (analysis JSON, exports markdown, figures, stability 매트릭스)
@@ -498,7 +506,7 @@ config 상수 (`config.py`):
 
 ### 2026-05-10 — 분석 스크립트 폴더 분리
 - root 분산 → `analyze/` (분류·내보내기·subtopic·compare_models)
-- 옛 viz 7개 → `figures/_legacy/` (regenerate_all.py가 정본)
+- 옛 viz 7개 → `figures/_legacy/` (regenerate_all.py가 정본 — 이후 2026-05-31 `analyze/make_figures.py`로 이동·개명)
 - root 4개 인프라만 유지: config, prompts, bill_loaders, duckdb_mcp_server
 
 ### 2026-05-09 — DB 분리 (raw / analysis)

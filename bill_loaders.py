@@ -10,7 +10,7 @@ Public signatures (preserved across the migration):
 - load_eu_bills(include=("act","amendments"), enrich=True) -> list[dict]
 
 Returned dict shape is identical to the pre-migration version so that
-figures/regenerate_all.py and validators don't need changes.
+analyze/make_figures.py and validators don't need changes.
 """
 
 from __future__ import annotations
