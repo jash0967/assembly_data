@@ -89,8 +89,27 @@ def valid_keys_for(con, api_id: str, stale_days: int = 7,
     return valid
 
 
+_AGE_KEY = "age"
+
+
+def _canonical_age_key(rows: list[dict]) -> str:
+    """Spelling to store the age under for this batch.
+
+    DuckDB identifiers are case-insensitive, so an API-supplied ``AGE`` and our
+    injected ``age`` are the *same* column: emitting both blows up CREATE /
+    ALTER / INSERT. Reuse whatever casing the API sent so the on-disk schema
+    never drifts (9 tables were seeded with ``AGE VARCHAR``).
+    """
+    for row in rows:
+        for k in row:
+            if k.lower() == _AGE_KEY:
+                return k
+    return _AGE_KEY
+
+
 def transform_rows(rows: list[dict], task_key: str, age_source: str = "none") -> list[dict]:
     transformed = []
+    age_key = _canonical_age_key(rows)
     for row in rows:
         cleaned = {"_task_key": task_key}
         for k, v in row.items():
@@ -101,7 +120,16 @@ def transform_rows(rows: list[dict], task_key: str, age_source: str = "none") ->
             cleaned[k] = v
         # Write-time age injection. None for `join:...` (resolved post-insert)
         # or when source value is missing — backfill / validator handles those.
-        cleaned["age"] = derive_age(age_source, task_key=task_key, row=cleaned)
+        derived = derive_age(age_source, task_key=task_key, row=cleaned)
+        # Fold every casing variant into the single canonical key. When the
+        # derivation yields nothing, keep the API's own value so the validator's
+        # "no NULL age" invariant keeps holding on AGE-bearing tables.
+        raw_age = None
+        for k in [k for k in cleaned if k.lower() == _AGE_KEY]:
+            v = cleaned.pop(k)
+            if raw_age is None:
+                raw_age = v
+        cleaned[age_key] = derived if derived is not None else raw_age
         transformed.append(cleaned)
     return transformed
 
@@ -134,12 +162,12 @@ def save_rows(db_holder, table_name, task_key, api_id, name_kr, rows, age_source
     con = db_holder[0]
 
     all_cols = []
-    seen = set()
+    seen = set()   # case-folded: DuckDB treats "AGE" and "age" as one column
     for row in rows:
         for k in row.keys():
-            if k not in seen:
+            if k.lower() not in seen:
                 all_cols.append(k)
-                seen.add(k)
+                seen.add(k.lower())
 
     _ensure_table(con, table_name, all_cols)
     tbl = _quote_ident(table_name)
@@ -180,7 +208,7 @@ _TYPED_COLUMNS = {"age": "INTEGER"}
 
 
 def _column_type(col: str) -> str:
-    return _TYPED_COLUMNS.get(col, "VARCHAR")
+    return _TYPED_COLUMNS.get(col.lower(), "VARCHAR")
 
 
 def _ensure_table(con, table_name, columns):
@@ -194,15 +222,19 @@ def _ensure_table(con, table_name, columns):
         col_defs = ", ".join(f"{_quote_ident(c)} {_column_type(c)}" for c in columns)
         con.execute(f"CREATE TABLE {tbl} ({col_defs})")
     else:
+        # Case-folded compare: DuckDB identifiers are case-insensitive, so
+        # ADD COLUMN "age" against a table already holding "AGE" raises
+        # `Catalog Error: Column with name age already exists!`.
         existing = {
-            r[0] for r in con.execute(
+            r[0].lower() for r in con.execute(
                 "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
                 [table_name],
             ).fetchall()
         }
         for c in columns:
-            if c not in existing:
+            if c.lower() not in existing:
                 con.execute(f"ALTER TABLE {tbl} ADD COLUMN {_quote_ident(c)} {_column_type(c)}")
+                existing.add(c.lower())
 
 
 def _estimate_tasks(spec, age_range, con=None) -> int:

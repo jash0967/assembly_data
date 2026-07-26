@@ -176,14 +176,20 @@ def save_bill_text(bill_id: str, age: int, reason: str | None,
         _db_con.execute(BILL_TEXT_INSERT, [bill_id, age, reason, full_text, pdf_path])
 
 
+def _reader_con():
+    """Return the shared write connection (DuckDB forbids mixing RO+RW in same process)."""
+    return _db_con if _db_con is not None else duckdb.connect(config.RAW_DB_PATH, read_only=True)
+
+
 def load_existing_bill_ids(age: int) -> set[str]:
-    con = duckdb.connect(config.RAW_DB_PATH, read_only=True)
+    con = _reader_con()
     try:
         rows = con.execute(
             "SELECT bill_id FROM bill_text WHERE age = ?", [age]
         ).fetchall()
     finally:
-        con.close()
+        if con is not _db_con:
+            con.close()
     return {r[0] for r in rows}
 
 
