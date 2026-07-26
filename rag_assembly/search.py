@@ -3,7 +3,7 @@
 Phase 5 Python API의 핵심.
 
 검색 플로우:
-  1. query → embedder (RETRIEVAL_QUERY task type)
+  1. query → embedder (로컬 arctic-ko, "query: " prefix는 embedder 내부에서 주입)
   2. ChromaDB top 30 (벡터)
   3. BM25 top 30 (키워드)
   4. RRF로 결합 → 후보 60개 (중복 제거)
@@ -31,9 +31,21 @@ class AssemblySearch:
     def __init__(self):
         self.vdb = VectorDB()
         self.bm25 = BM25Index()
-        self.embedder = Embedder()
+        self._embedder: Embedder | None = None
         self._reranker: Reranker | None = None
         self._bm25_loaded = False
+
+    @property
+    def embedder(self) -> Embedder:
+        """lazy — BM25 전용·메타필터 전용 경로에서 임베딩 모델을 로드하지 않는다.
+
+        (구 Vertex Embedder는 생성만으로 ADC 인증 + region별 클라이언트 8개를
+        만들었고, 로컬 모델은 생성만으로 568M 가중치를 GPU에 올린다.
+        어느 쪽이든 검색과 무관한 경로에서 낼 비용이 아니다.)
+        """
+        if self._embedder is None:
+            self._embedder = Embedder()
+        return self._embedder
 
     def _ensure_bm25(self):
         if not self._bm25_loaded:

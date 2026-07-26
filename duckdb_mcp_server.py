@@ -21,10 +21,16 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TQDM_DISABLE", "1")
-# HF Hub HEAD request로 캐시 신선도 검증하면 FastMCP context에서 hang.
-# offline 모드로 강제 → 로컬 캐시만 사용.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# HF Hub HEAD request로 캐시 신선도 검증하면 FastMCP context에서 hang한다.
+# 그 차단은 이제 **로드 호출 단위**로 한다 —
+# rag_assembly/embedder.py::_build()가 고정 revision 스냅샷이 캐시에 있으면
+# SentenceTransformer(..., local_files_only=True)로 연다 (이 프로세스에서
+# HF 모델을 로드하는 유일한 경로다).
+# 여기서 HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE을 프로세스 전역으로 켜지 않는 이유:
+# huggingface_hub이 import 시점에 그 값을 모듈 상수로 굳혀서, 나중에 되돌려도
+# 이 프로세스의 **다른 모든** HF 모델(미캐시 모델 포함)이 영구히 다운로드 불가가
+# 되고 원인을 알기 어려운 offline 에러로 나타난다.
+# (호스트가 명시적으로 HF_HUB_OFFLINE=1을 넘기면 그건 그대로 존중된다.)
 
 # logging 레벨 (HF 비인증 warning 등 차단)
 import logging as _logging
@@ -554,6 +560,96 @@ def _worker_stdout_guard():
         sys.stdout = saved
 
 
+def _register_embed_load_guard() -> None:
+    """rag_assembly.embedder 의 '모델 로드' 구간에 위 stdout 가드를 물린다.
+
+    로컬 임베딩 모델(sentence-transformers) 로드는 huggingface_hub·transformers가
+    stdout으로 뭔가 뱉을 수 있는 유일한 구간이다. 인코딩 자체는 조용하다.
+    가드 창이 겹치지 않도록, 로드를 유발하는 MCP 경로는 모두 _BM25_LOCK 안에서
+    부른다 (_embed_query_inproc / _embed_warmup_now).
+    """
+    try:
+        with _worker_stdout_guard():
+            import embedder as _rag_embedder   # numpy+config만 — 모델은 lazy
+        _rag_embedder.set_load_guard(_worker_stdout_guard)
+        sys.stderr.write("[mcp] embed load guard registered\n")
+    except Exception as e:  # noqa: BLE001 — 가드 미등록이 서버를 죽이면 안 된다
+        sys.stderr.write(f"[mcp] embed load guard 등록 실패(무시): "
+                         f"{type(e).__name__}: {e}\n")
+    sys.stderr.flush()
+
+
+_register_embed_load_guard()
+
+
+# ── 질의 임베딩 모델 warm-up ──────────────────────────
+# 첫 rag_search에서 568M 모델을 로드하면 그 호출만 수 초 느려진다(실측 GPU 2s,
+# 콜드 캐시·CPU면 수십 초). BM25와 **독립된** 데몬 스레드로 미리 올려 둔다.
+# BM25 로더와 별개인 이유: BM25 인덱스가 없거나 preimport가 실패하면 그 스레드는
+# 아예 뜨지 않는데, 질의 임베딩은 그 경우에도 필요하다(벡터 단독 검색).
+# 실패해도 무해 — 검색 시점에 lazy 로드가 다시 시도된다. BM25 상태와 섞지 않는다.
+_EMBED_WARMUP_STATE = "idle"     # idle | loading | ready | failed | disabled
+_EMBED_WARMUP_ERROR: str | None = None
+# BM25보다 조금 늦게 시작해 handshake·BM25에 우선권을 준다 (어차피 _BM25_LOCK으로
+# 직렬화되므로 순서가 뒤집혀도 정합성 문제는 없다).
+_EMBED_WARMUP_DELAY_S = 3.0
+
+
+def _embed_warmup_enabled() -> bool:
+    return os.environ.get("MCP_EMBED_WARMUP", "1").strip() not in ("0", "false", "False")
+
+
+def _embed_warmup_now() -> None:
+    """질의 임베딩 모델 선로드. _BM25_LOCK으로 stdout 가드 창을 직렬화한다.
+
+    lock을 공유하는 이유: _worker_stdout_guard()의 안전 전제가 '가드 창이
+    겹치지 않는다'이고, 모델 로드도 그 가드를 쓰기 때문이다(_register_embed_load_guard).
+    BM25 로드가 lock을 쥐고 있으면 여기서 기다린다 — 데몬 스레드라 무해하다.
+    """
+    global _EMBED_WARMUP_STATE, _EMBED_WARMUP_ERROR
+    if not _embed_warmup_enabled():
+        _EMBED_WARMUP_STATE = "disabled"
+        return
+    t0 = _time.time()
+    try:
+        import embedder as _rag_embedder
+        _EMBED_WARMUP_STATE = "loading"
+        with _BM25_LOCK:
+            _rag_embedder.load_model()
+        _EMBED_WARMUP_STATE = "ready"
+        _EMBED_WARMUP_ERROR = None
+        sys.stderr.write(
+            f"[mcp] embed model warm in {_time.time()-t0:.1f}s "
+            f"(device={_rag_embedder.loaded_device()})\n")
+    except Exception as e:  # noqa: BLE001
+        _EMBED_WARMUP_STATE = "failed"
+        _EMBED_WARMUP_ERROR = f"{type(e).__name__}: {e}"
+        sys.stderr.write(f"[mcp] embed warm-up failed (검색 시 재시도): "
+                         f"{_EMBED_WARMUP_ERROR}\n")
+    sys.stderr.flush()
+
+
+def _start_embed_warmup(delay: float | None = None) -> str:
+    """질의 임베딩 모델 warm-up을 데몬 스레드로 시작. mcp.run() 진입 직전 호출."""
+    global _EMBED_WARMUP_STATE
+    if not _embed_warmup_enabled():
+        _EMBED_WARMUP_STATE = "disabled"
+        sys.stderr.write("[mcp] embed warm-up disabled (MCP_EMBED_WARMUP=0)\n")
+        sys.stderr.flush()
+        return _EMBED_WARMUP_STATE
+    d = _EMBED_WARMUP_DELAY_S if delay is None else delay
+
+    def _worker():
+        if d > 0:
+            _time.sleep(d)
+        _embed_warmup_now()
+
+    _threading.Thread(target=_worker, name="embed-warmup", daemon=True).start()
+    sys.stderr.write(f"[mcp] embed warm-up scheduled (delay={d:.1f}s)\n")
+    sys.stderr.flush()
+    return "scheduled"
+
+
 def _bm25_load_now(engine=None) -> None:
     """실제 로드 (lock으로 보호). 실패 시 예외를 그대로 올린다.
 
@@ -763,9 +859,28 @@ def _format_rag_results(results: list[dict], max_text: int = 400) -> str:
     return "\n".join(out)
 
 
-def _simple_embed_query(query: str) -> list:
-    """FastMCP context에서 모든 네트워크 호출이 hang하는 문제를 회피하기 위해
-    subprocess로 외부 Python을 spawn해서 embedding 받아옴.
+def _embed_query_inproc(query: str) -> list:
+    """in-process 질의 임베딩 (기본 경로).
+
+    "query: " prefix는 embedder.embed_query() 안에서만 붙는다.
+    모델 로드는 프로세스당 1회 — 아직 안 올라왔을 때만 _BM25_LOCK을 잡아
+    stdout 가드 창이 BM25 로드 가드와 겹치지 않게 한다. 이미 로드된 뒤에는
+    lock 없이 곧장 인코딩한다(인코딩은 stdout에 쓰지 않는다).
+    """
+    import embedder as _rag_embedder
+    if not _rag_embedder.is_loaded():
+        with _BM25_LOCK:
+            _rag_embedder.load_model()
+    return _rag_embedder.embed_query(query)
+
+
+def _embed_query_subproc(query: str) -> list:
+    """격리 subprocess 질의 임베딩 (fallback).
+
+    질의마다 568M 모델을 새로 로드하므로 느리다. in-process 경로가 실패하거나
+    MCP_EMBED_SUBPROC=1 일 때만 쓴다. (옛 Vertex 시절엔 이게 기본 경로였다 —
+    google-genai 네트워크 호출이 FastMCP context에서 hang했기 때문. 로컬
+    모델에는 그 원인이 없다.)
     """
     import json
     import subprocess
@@ -779,11 +894,30 @@ def _simple_embed_query(query: str) -> list:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        timeout=60,
+        # 옛 60초는 HTTP 1회 기준. 지금은 콜드 캐시에서 모델 로드(CPU 폴백
+        # 포함)까지 포함하므로 넉넉히 잡는다.
+        timeout=300,
     )
     if r.returncode != 0:
         raise RuntimeError(f"embed subprocess failed: {r.stderr}")
     return json.loads(r.stdout)["vector"]
+
+
+def _simple_embed_query(query: str) -> list:
+    """질의 → 1024-dim 단위벡터 (로컬 arctic-ko).
+
+    기본 in-process, MCP_EMBED_SUBPROC=1이면 격리 subprocess.
+    in-process가 터지면 subprocess로 1회 폴백한다.
+    """
+    if os.environ.get("MCP_EMBED_SUBPROC", "").strip() in ("1", "true", "True"):
+        return _embed_query_subproc(query)
+    try:
+        return _embed_query_inproc(query)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[rag] in-proc embed 실패 → subprocess 폴백: "
+                         f"{type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        return _embed_query_subproc(query)
 
 
 def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
@@ -792,6 +926,9 @@ def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
     global _BM25_STATE, _BM25_ERROR   # Step 2에서 실패를 latch
     import time
     from api import _get_engine
+    # 메타필터를 BM25 결과에 적용하는 판정자는 정본(search.py)의 것을 그대로 쓴다.
+    # 여기에 복제본을 두면 $eq/$in 지원 범위가 정본과 갈라진다 (D1 재발 경로).
+    from search import _matches_where
     import config as _cfg
 
     t0 = time.time()
@@ -799,9 +936,10 @@ def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
     sys.stderr.write(f"[rag] eng_obj acquired {time.time()-t0:.2f}s\n")
     sys.stderr.flush()
 
-    # Step 1a: embed query via raw HTTP (google-genai hangs in FastMCP context)
+    # Step 1a: embed query — 로컬 arctic-ko, "query: " prefix는 embedder 내부에서
     t = time.time()
-    sys.stderr.write(f"[rag] >>> embed_query (raw HTTP) starting\n"); sys.stderr.flush()
+    sys.stderr.write("[rag] >>> embed_query (local arctic-ko) starting\n")
+    sys.stderr.flush()
     qv = _simple_embed_query(query)
     sys.stderr.write(f"[rag] embed_query {time.time()-t:.2f}s (dim={len(qv)})\n")
     sys.stderr.flush()
@@ -888,6 +1026,20 @@ def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
                     f"(state 유지={_BM25_STATE}): {type(e).__name__}: {e}\n")
                 sys.stderr.flush()
         sys.stderr.write(f"[rag] bm25_search {time.time()-t:.2f}s ({len(b_results)} hits)\n")
+        sys.stderr.flush()
+
+    # Step 2b: 메타필터를 BM25 결과에도 적용 (BM25는 native filter가 없다).
+    # 벡터 팔은 vdb.query(where=...)로 이미 걸러져 있는데 여기서 거르지 않으면
+    # 필터 밖 소스가 RRF를 타고 결과에 섞인다 — 반드시 RRF **이전**에 건다.
+    # 정본 search.py::AssemblySearch.hybrid()와 같은 판정자·같은 위치.
+    # metadata가 없는 BM25-only 후보({} 취급)는 필터가 걸린 순간 탈락한다 —
+    # 이것도 정본과 동일하다 (소속을 증명할 수 없는 후보를 통과시키지 않는다).
+    if where:
+        _n_before = len(b_results)
+        b_results = [r for r in b_results
+                     if _matches_where(r.get("metadata") or {}, where)]
+        sys.stderr.write(f"[rag] bm25 where-filter {_n_before} → "
+                         f"{len(b_results)} hits (where={where})\n")
         sys.stderr.flush()
 
     # Step 3: RRF + dedup + fetch text for BM25-only candidates
@@ -1049,6 +1201,18 @@ def rag_stats() -> str:
     out = ["=== rag_assembly 인덱스 현황 ==="]
     out.append(f"LanceDB total chunks: {s['vectordb_count']:,}")
     out.append(f"embed_config_version: {s['embed_config_version']}")
+    try:
+        import config as _rcfg
+        import embedder as _remb
+        out.append(f"embed model: {_rcfg.EMBED_MODEL} "
+                   f"(dim={_rcfg.EMBED_DIM}, query_prefix={_rcfg.EMBED_QUERY_PREFIX!r}, "
+                   f"device={_remb.loaded_device() or 'not loaded'}, "
+                   f"warmup={_EMBED_WARMUP_STATE})")
+        mism = _rcfg.embed_contract_mismatches()
+        if mism:
+            out.append("⚠ embed_config 계약 불일치: " + "; ".join(mism))
+    except Exception as e:  # noqa: BLE001 — 통계 조회가 이것 때문에 죽으면 안 된다
+        out.append(f"(embed 설정 조회 실패: {type(e).__name__}: {e})")
     out.append("\n소스별 분포:")
     for k, v in s["chunks_by_source"].items():
         out.append(f"  {k:12s} {v:>10,}")
@@ -1056,6 +1220,8 @@ def rag_stats() -> str:
 
 
 if __name__ == "__main__":
-    # BM25 로드는 handshake와 분리 — mcp.run() 진입을 막지 않는다.
+    # BM25 로드·임베딩 모델 로드 모두 handshake와 분리 — mcp.run() 진입을 막지
+    # 않는다. 둘 다 데몬 스레드이고 _BM25_LOCK으로 서로 직렬화된다.
     _start_bm25_loader()
+    _start_embed_warmup()
     mcp.run()
