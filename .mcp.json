@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "assembly-db": {
+      "command": "/home/jays0967/assembly_data/.venv/bin/python",
+      "args": ["/home/jays0967/assembly_data/duckdb_mcp_server.py"]
+    }
+  }
+}

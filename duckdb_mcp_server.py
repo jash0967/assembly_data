@@ -35,6 +35,8 @@ _logging.getLogger("sentence_transformers").setLevel(_logging.ERROR)
 # (2) 노이즈를 stdout 대신 stderr로 흘려보낸 뒤 RAG 라이브러리 사전 import.
 #     mcp.run()이 시작된 후에 stdout으로 출력되면 protocol이 깨지므로,
 #     startup 시점에 일괄로 처리.
+_PREIMPORTED_API = None  # 아래 preimport가 성공하면 dict로 교체
+_PREIMPORT_GET_ENGINE = None  # api._get_engine (BM25 백그라운드 로더가 사용)
 _saved_stdout_fd = os.dup(1)
 os.dup2(2, 1)  # stdout fd → stderr fd
 try:
@@ -61,11 +63,12 @@ try:
             "lookup_bill_by_id": lookup_bill_by_id,
             "stats": stats,
         }
-        # BM25 13 sub-index 미리 로드 (standalone ~10초). startup에서 끝내야
-        # 첫 RAG 호출이 빠름. FastMCP context에 들어가기 전이라 안전.
-        _eng = _get_engine()
-        _eng._ensure_bm25()
-        sys.stderr.write("[mcp] RAG preimport + BM25 load done\n")
+        # BM25 sub-index 로드는 여기서 하지 않는다 (아래 _start_bm25_loader 참조).
+        # 동기 로드는 인덱스 크기에 비례해 수십 초까지 늘어나고, 그동안
+        # mcp.run()에 도달하지 못해 클라이언트의 MCP startup timeout(30s)을
+        # 유발한다. handshake와 분리해 백그라운드 daemon thread로 옮겼다.
+        _PREIMPORT_GET_ENGINE = _get_engine
+        sys.stderr.write("[mcp] RAG preimport done (BM25 load deferred)\n")
     except Exception as _e:
         _PREIMPORTED_API = None
         sys.stderr.write(f"[mcp] RAG preimport failed: {_e}\n")
@@ -369,6 +372,309 @@ speech_issues: 27개 카테고리 키워드 태깅 ({fmt(speech_issues)}건). ra
 
 _rag_engine = None
 
+# RAG 인덱스 실물 경로 (rag_assembly/config.py의 DATA_DIR·BM25_PKL·LANCE_DIR와 대응).
+# BM25Index.__init__은 cfg.BM25_PKL의 '.pkl' 접미사를 떼고 디렉터리로 쓰므로
+# 실제 root는 data/bm25 — 접미사 유무 양쪽 다 인정한다.
+_RAG_DATA_DIR = os.path.join(_REPO_ROOT, "rag_assembly", "data")
+_RAG_BM25_MANIFESTS = (
+    os.path.join(_RAG_DATA_DIR, "bm25", "manifest.json"),
+    os.path.join(_RAG_DATA_DIR, "bm25.pkl", "manifest.json"),
+)
+_RAG_LANCE_TABLE = os.path.join(_RAG_DATA_DIR, "lance_db", "chunks.lance")
+
+
+def _dir_has_entry(path: str) -> bool:
+    """디렉터리가 존재하고 항목이 하나 이상 있으면 True (전체 나열 없이 조기 종료)."""
+    try:
+        with os.scandir(path) as it:
+            for _ in it:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _rag_index_missing() -> list[str]:
+    """RAG 인덱스 구성요소 중 없는 것 목록. 빈 리스트면 정상."""
+    missing = []
+    if not any(os.path.exists(p) for p in _RAG_BM25_MANIFESTS):
+        missing.append("BM25 manifest (rag_assembly/data/bm25/manifest.json)")
+    # LanceDB 테이블은 data/ 하위에 fragment 파일이 있어야 실제 데이터가 있는 것
+    if not _dir_has_entry(os.path.join(_RAG_LANCE_TABLE, "data")):
+        missing.append("LanceDB chunks 데이터 (rag_assembly/data/lance_db/chunks.lance/data)")
+    return missing
+
+
+def _rag_unavailable_reason() -> str | None:
+    """RAG 사용 불가면 사용자에게 보여줄 안내 메시지, 사용 가능하면 None.
+
+    판정 기준은 인덱스 실물 파일 존재 여부이고, startup preimport 결과는 보조 정보.
+    벡터 인덱스(LanceDB)가 없으면 검색 자체가 불가능하므로 즉시 안내를 반환한다.
+    BM25만 없는 경우는 기존 코드가 vector-only로 degrade하므로 막지 않는다.
+    인덱스가 정상적으로 존재하면 None → 기존 동작이 그대로 유지된다.
+    """
+    missing = _rag_index_missing()
+    lance_ok = _dir_has_entry(os.path.join(_RAG_LANCE_TABLE, "data"))
+    if not missing or lance_ok:
+        return None
+    pre = ("startup preimport도 실패한 상태"
+           if _PREIMPORTED_API is None else "startup preimport 자체는 성공")
+    return (
+        "RAG 인덱스 미구축 (rag_assembly/data에 BM25·LanceDB 인덱스 없음 — "
+        "WSL 이주 시 유실).\n"
+        f"없는 구성요소: {', '.join(missing)}\n"
+        f"참고: {pre}.\n"
+        "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
+        "정상 사용 가능합니다.\n"
+        "인덱스 재구축은 rag_assembly/indexer.py 참조."
+    )
+
+
+# ── BM25 백그라운드 로드 (handshake 분리) ─────────────
+# BM25는 13개 sub-index를 pickle/bm25s로 읽어들이므로 인덱스가 커질수록
+# 로드가 길어진다(현 설계 기준 10초+). 이를 startup에서 동기로 하면
+# mcp.run() 진입이 그만큼 늦어져 클라이언트의 MCP startup timeout(30s)에
+# 걸린다. 그래서 daemon thread로 분리하고, 로드 중 들어온 rag_* 호출은
+# 블로킹 대기 대신 즉시 "로딩 중" 안내를 돌려준다.
+#
+# stdout 보호: 스레드 안에서 os.dup2 같은 **fd 레벨** redirect는 쓰지 않는다
+# (프로세스 전역 fd 1을 바꾸면 FastMCP의 응답 쓰기와 경합 — 과거 실패 이력은
+#  _safe_rag_call() 주석 참조). 대신 Python 레벨 sys.stdout 가드
+# (_worker_stdout_guard)로 로드 구간의 print()류만 stderr로 돌린다.
+# 이게 안전한 근거: mcp/server/stdio.py::stdio_server()가 startup에
+# TextIOWrapper(sys.stdout.buffer)를 만들어 AsyncFile로 **객체 참조**를 잡아두고
+# 그것으로 응답을 쓴다 — 이후 sys.stdout 이름을 다시 조회하지 않으므로
+# sys.stdout 교체는 진행 중인 FastMCP 응답에 영향이 없다. 아직 캡처 전이라
+# 창이 겹치는 경우까지는 _StdoutToStderr.buffer가 처리한다 (그 docstring 참조).
+# 잔여 위험(막지 않음): os.write(1, ...) / sys.stdout.buffer.write(...) 처럼
+# fd·binary buffer에 직접 쓰는 확장 라이브러리는 Python 레벨 가드로 차단 불가.
+# 이를 막으려면 프로세스 전역 fd redirect가 필요한데 그건 FastMCP 응답과
+# 경합하므로 의도적으로 시도하지 않는다.
+import contextlib as _contextlib
+import threading as _threading
+import time as _time
+
+_BM25_STATE = "absent"     # absent | deferred | loading | ready | failed
+_BM25_STARTED_AT: float | None = None
+_BM25_ERROR: str | None = None
+_BM25_LOCK = _threading.Lock()   # 로드 이중 실행 방지 (백그라운드 ↔ lazy 경로)
+
+# 로더 시작 전 유예 시간(초). BM25 로드는 pickle 등 GIL을 오래 쥐는 구간이
+# 있어서, initialize/tools/list handshake가 끝나기 전에 시작하면 응답이
+# 밀릴 수 있다. 아주 짧게 미뤄 handshake에 우선권을 준다.
+_BM25_LOAD_DELAY_DEFAULT_S = 2.0
+# 상한. handshake 양보가 목적이라 수 초면 충분한데, 오타(예: 86400)를 그대로
+# 받으면 로더가 하루를 자고 rag_* 가 영영 "로딩 중"에 머문다. 초과 시 clamp.
+_BM25_LOAD_DELAY_MAX_S = 60.0
+
+
+def _read_bm25_load_delay() -> float:
+    """MCP_BM25_LOAD_DELAY 파싱. 비수치·음수면 경고 후 기본값, 과대값은 상한 clamp.
+
+    import 시점에 float()이 ValueError를 던지면 서버 프로세스 자체가 뜨지
+    못해 DuckDB 도구까지 못 쓰게 되므로, 잘못된 값은 무시하고 살아남는다.
+    """
+    raw = os.environ.get("MCP_BM25_LOAD_DELAY")
+    if raw is None or raw.strip() == "":
+        return _BM25_LOAD_DELAY_DEFAULT_S
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        sys.stderr.write(
+            f"[mcp] MCP_BM25_LOAD_DELAY={raw!r} 는 숫자가 아님 — "
+            f"기본값 {_BM25_LOAD_DELAY_DEFAULT_S}초 사용\n")
+        sys.stderr.flush()
+        return _BM25_LOAD_DELAY_DEFAULT_S
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:  # NaN/inf/음수
+        sys.stderr.write(
+            f"[mcp] MCP_BM25_LOAD_DELAY={raw!r} 는 유효 범위 밖 — "
+            f"기본값 {_BM25_LOAD_DELAY_DEFAULT_S}초 사용\n")
+        sys.stderr.flush()
+        return _BM25_LOAD_DELAY_DEFAULT_S
+    if v > _BM25_LOAD_DELAY_MAX_S:
+        sys.stderr.write(
+            f"[mcp] MCP_BM25_LOAD_DELAY={raw!r} 는 상한 초과 — "
+            f"{_BM25_LOAD_DELAY_MAX_S:.0f}초로 제한\n")
+        sys.stderr.flush()
+        return _BM25_LOAD_DELAY_MAX_S
+    return v
+
+
+_BM25_LOAD_DELAY_S = _read_bm25_load_delay()
+
+
+def _bm25_index_present() -> bool:
+    return any(os.path.exists(p) for p in _RAG_BM25_MANIFESTS)
+
+
+class _StdoutToStderr:
+    """가드 창 동안 sys.stdout 자리를 대신하는 프록시.
+
+    - write()/flush() 등 텍스트 출력 → stderr (print() protocol 오염 차단)
+    - .buffer → **진짜 stdout의 binary buffer**를 그대로 노출.
+
+    .buffer를 stderr로 돌리면 안 되는 이유(실측): mcp/server/stdio.py의
+    stdio_server()는 mcp.run() 진입 시점에 TextIOWrapper(sys.stdout.buffer)를
+    만들어 그 객체로 응답을 쓴다. 로더가 delay=0 등으로 그 캡처보다 먼저
+    가드를 잡으면 FastMCP가 stderr의 buffer를 잡아가 **응답 전체가 stderr로**
+    새어나간다 (initialize 무응답). 진짜 buffer를 노출해 이 경합을 원천 차단.
+    """
+    def __init__(self, real_stdout):
+        self._real_stdout = real_stdout
+
+    @property
+    def buffer(self):
+        return self._real_stdout.buffer
+
+    def write(self, s):
+        return sys.stderr.write(s)
+
+    def flush(self):
+        return sys.stderr.flush()
+
+    def __getattr__(self, name):   # 나머지 파일 API는 stderr에 위임
+        return getattr(sys.stderr, name)
+
+
+@_contextlib.contextmanager
+def _worker_stdout_guard():
+    """로드 구간 동안 sys.stdout → stderr 프록시. print()류의 protocol 오염 방지.
+
+    프로세스 전역이지만 (a) FastMCP는 startup에 잡아둔 stream 객체로 응답을
+    쓰므로 영향이 없고, (b) 구간 전체가 _BM25_LOCK 안이라 중첩·경합이 없으며,
+    (c) 캡처 시점이 가드 창과 겹쳐도 .buffer가 진짜 stdout이라 안전하다.
+    막지 못하는 것(잔여 위험): os.write(1, ...) / sys.stdout.buffer.write(...)
+    처럼 fd·binary buffer에 직접 쓰는 확장 라이브러리 — 상단 주석 참조.
+    """
+    saved = sys.stdout
+    sys.stdout = _StdoutToStderr(saved)
+    try:
+        yield
+    finally:
+        sys.stdout = saved
+
+
+def _bm25_load_now(engine=None) -> None:
+    """실제 로드 (lock으로 보호). 실패 시 예외를 그대로 올린다.
+
+    engine: AssemblySearch 인스턴스. 생략하면 preimport한 _get_engine()을 쓴다.
+    """
+    global _BM25_STATE, _BM25_ERROR
+    with _BM25_LOCK:
+        # 'failed'도 조기 반환 대상이다 (R5). deferred + 느린 실패 로드에서
+        # lock을 기다리던 동시 요청들이 각자 전체 로드를 순차 재실행하던 문제
+        # (실측 3.00/6.00/9.00s) — 앞선 시도가 남긴 latch를 확인하고 즉시 돌아간다.
+        if _BM25_STATE in ("ready", "failed"):
+            return
+        # 가드는 lock 안에서만 살아 있다 — 백그라운드 로더 경로와
+        # deferred lazy 경로 둘 다 여기를 지나므로 한 곳으로 충분하다.
+        try:
+            with _worker_stdout_guard():
+                eng = engine
+                if eng is None:
+                    if _PREIMPORT_GET_ENGINE is None:
+                        raise RuntimeError("rag_assembly preimport 실패 — 엔진 없음")
+                    eng = _PREIMPORT_GET_ENGINE()
+                eng._ensure_bm25()
+        except FileNotFoundError:
+            # 인덱스 '부재'는 실패로 latch하지 않는다 (호출자 정책: 조용히
+            # vector-only). 재시도 비용도 stat 한 번 수준이라 무해.
+            raise
+        except Exception as e:  # noqa: BLE001 — latch는 lock을 놓기 전에
+            # 실패 확정을 lock 안에서 해 둬야, 대기 중이던 동시 요청이 위의
+            # 조기 반환에 걸린다. 예외 자체는 호출자에게 그대로 올린다.
+            _BM25_STATE = "failed"
+            _BM25_ERROR = f"{type(e).__name__}: {e}"
+            raise
+        _BM25_STATE = "ready"
+        _BM25_ERROR = None
+
+
+def _bm25_loader_worker(delay: float) -> None:
+    global _BM25_STATE, _BM25_ERROR, _BM25_STARTED_AT
+    if delay > 0:
+        _time.sleep(delay)
+    t0 = _time.time()
+    # 경과 시간 기준점은 '실제 로드 시작' 시점 (delay 구간은 제외).
+    _BM25_STARTED_AT = t0
+    try:
+        _bm25_load_now()
+        sys.stderr.write(f"[mcp] BM25 background load done in {_time.time()-t0:.1f}s\n")
+    except Exception as e:  # noqa: BLE001 — 서버는 계속 살아 있어야 한다
+        _BM25_STATE = "failed"
+        _BM25_ERROR = f"{type(e).__name__}: {e}"
+        sys.stderr.write(f"[mcp] BM25 background load failed: {_BM25_ERROR}\n")
+    finally:
+        sys.stderr.flush()
+
+
+def _start_bm25_loader(delay: float | None = None) -> str:
+    """BM25 백그라운드 로드 시작. mcp.run() 진입 직전에 호출.
+
+    반환값은 시작 직후의 상태 문자열 (테스트·진단용).
+    """
+    global _BM25_STATE, _BM25_STARTED_AT
+    d = _BM25_LOAD_DELAY_S if delay is None else delay
+    # 상태 확인 → 전이 → 스레드 기동을 한 lock 안에서 처리 (check-then-set 원자화).
+    # _bm25_load_now()도 같은 lock을 쓰지만 워커는 delay 후에야 잡으러 오고,
+    # 이 블록은 파일 stat + Thread.start()만 하므로 곧바로 풀린다.
+    with _BM25_LOCK:
+        if _BM25_STATE in ("loading", "ready"):
+            return _BM25_STATE
+        if not _bm25_index_present() or _rag_unavailable_reason() is not None:
+            # BM25 인덱스가 없거나, 벡터(LanceDB) 인덱스가 없어 RAG 자체가 불가.
+            # 기존 _rag_unavailable_reason() 게이트가 담당하므로 로드하지 않는다.
+            _BM25_STATE = "absent"
+            msg = "[mcp] BM25 index absent/unusable — loader not started\n"
+        elif _PREIMPORT_GET_ENGINE is None:
+            # preimport 실패 → 엔진 핸들이 없다. 검색 경로의 lazy import에 맡긴다.
+            _BM25_STATE = "deferred"
+            msg = "[mcp] BM25 loader deferred (RAG preimport failed)\n"
+        else:
+            _BM25_STATE = "loading"
+            # 실제 로드 시작 시점은 워커가 delay를 소진한 뒤 기록한다 (F5).
+            _BM25_STARTED_AT = None
+            _threading.Thread(target=_bm25_loader_worker, args=(d,),
+                              name="bm25-loader", daemon=True).start()
+            msg = f"[mcp] BM25 background load started (delay={d:.1f}s)\n"
+        state = _BM25_STATE
+    sys.stderr.write(msg)
+    sys.stderr.flush()
+    return state
+
+
+def _bm25_gate_message() -> str | None:
+    """rag_* '검색' 도구 공통 진입 게이트. 즉답할 안내가 있으면 문자열, 없으면 None.
+
+    게이트 대상은 'loading' 하나뿐이다 (BM25 로드가 GIL을 오래 쥐는 동안
+    블로킹 대기 대신 즉답). 'failed'는 게이트하지 않는다 — BM25가 없으면
+    vector-only로 degrade한다는 기존 정책(_rag_unavailable_reason 참조)에
+    맞춰 검색은 통과시키고 _bm25_degraded_notice()로 안내만 덧붙인다.
+    """
+    if _BM25_STATE == "loading":
+        started = _BM25_STARTED_AT
+        # max(0, …) — 시스템 시계가 뒤로 조정되면 음수 경과가 찍힌다.
+        elapsed = ("곧 시작" if started is None
+                   else f"약 {max(0.0, _time.time()-started):.0f}초 경과")
+        return (
+            f"RAG 인덱스 로딩 중 ({elapsed}) — 잠시 후 재시도해 주세요.\n"
+            "BM25 sub-index를 백그라운드로 읽는 중이며, 완료되면 곧바로 검색이 됩니다.\n"
+            "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
+            "지금도 정상 사용 가능합니다."
+        )
+    return None
+
+
+def _bm25_degraded_notice() -> str:
+    """BM25 로드 실패 시 검색 결과 앞에 붙일 안내. 실패가 아니면 빈 문자열."""
+    if _BM25_STATE == "failed":
+        return (
+            f"(BM25 로드 실패 — 벡터 단독 검색: {_BM25_ERROR})\n"
+            "키워드 매칭이 빠진 결과이며, 인덱스가 손상된 경우 "
+            "rag_assembly/bm25.py 로 재빌드가 필요합니다.\n\n"
+        )
+    return ""
+
 
 def _get_rag_engine():
     """rag_assembly.api 싱글턴 반환. startup에서 미리 import한 것을 사용."""
@@ -377,31 +683,44 @@ def _get_rag_engine():
         if _PREIMPORTED_API is not None:
             _rag_engine = _PREIMPORTED_API
         else:
-            # fallback (preimport 실패한 경우만): fd 레벨 redirect 후 import
-            import sys, os
-            saved = os.dup(1); os.dup2(2, 1)
-            try:
-                rag_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), "rag_assembly")
-                if rag_path not in sys.path:
-                    sys.path.insert(0, rag_path)
-                import _bootstrap  # noqa: F401
-                from api import (search, search_bills, search_bill_metas,
-                                  search_speeches, search_documents,
-                                  search_members, lookup_member_by_name,
-                                  lookup_bill_by_id, stats)
-                _rag_engine = {
-                    "search": search, "search_bills": search_bills,
-                    "search_bill_metas": search_bill_metas,
-                    "search_speeches": search_speeches,
-                    "search_documents": search_documents,
-                    "search_members": search_members,
-                    "lookup_member_by_name": lookup_member_by_name,
-                    "lookup_bill_by_id": lookup_bill_by_id,
-                    "stats": stats,
-                }
-            finally:
-                os.dup2(saved, 1); os.close(saved)
+            # fallback (preimport 실패한 경우만): import 노이즈 차단.
+            #
+            # 여기서 fd 레벨 redirect(os.dup(1) → os.dup2(2,1) → 복원)를 쓰면
+            # 안 된다. rag_* 도구는 asyncio.to_thread 워커에서 동시에 실행될 수
+            # 있고, 두 번째 워커의 os.dup(1)은 '이미 stderr가 된 fd 1'을 저장해
+            # 복원 자체가 오염을 확정시킨다 → fd 1이 영구히 stderr로 고정되고
+            # 이후 모든 MCP 응답이 stderr로 새어 서버가 조용히 죽는다
+            # (동시 3건 중 2/2회 재현).
+            # 대신 같은 파일에서 이미 검증된 Python 레벨 가드를 재사용한다.
+            # 가드의 안전 전제("구간 전체가 _BM25_LOCK 안이라 중첩·경합 없음")를
+            # 그대로 유지하려고 _BM25_LOCK으로 감싼다 — _bm25_load_now()의 가드
+            # 구간과도 상호 배제된다. 호출 순서상(_rag_search_sync가 이 함수를
+            # 끝낸 뒤 _bm25_load_now()를 호출) 재진입·deadlock은 없다.
+            with _BM25_LOCK:
+                if _rag_engine is None:      # lock 대기 중 다른 워커가 채웠으면 skip
+                    with _worker_stdout_guard():
+                        rag_path = os.path.join(
+                            os.path.dirname(os.path.abspath(__file__)),
+                            "rag_assembly")
+                        if rag_path not in sys.path:
+                            sys.path.insert(0, rag_path)
+                        import _bootstrap  # noqa: F401
+                        from api import (search, search_bills,
+                                          search_bill_metas,
+                                          search_speeches, search_documents,
+                                          search_members,
+                                          lookup_member_by_name,
+                                          lookup_bill_by_id, stats)
+                        _rag_engine = {
+                            "search": search, "search_bills": search_bills,
+                            "search_bill_metas": search_bill_metas,
+                            "search_speeches": search_speeches,
+                            "search_documents": search_documents,
+                            "search_members": search_members,
+                            "lookup_member_by_name": lookup_member_by_name,
+                            "lookup_bill_by_id": lookup_bill_by_id,
+                            "stats": stats,
+                        }
     return _rag_engine
 
 
@@ -450,8 +769,8 @@ def _simple_embed_query(query: str) -> list:
     """
     import json
     import subprocess
-    py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "venv", "Scripts", "python.exe")
+    # 서버 자신을 띄운 인터프리터(.venv/bin/python)를 그대로 사용.
+    py = sys.executable
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "rag_assembly", "_subproc_embed.py")
     r = subprocess.run(
@@ -470,6 +789,7 @@ def _simple_embed_query(query: str) -> list:
 def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
     """MCP 환경: subprocess로 embed 한 뒤 hybrid 검색 (rerank 없음).
     reranker 로드가 FastMCP context에서 hang하므로 dense+BM25+RRF만 사용."""
+    global _BM25_STATE, _BM25_ERROR   # Step 2에서 실패를 latch
     import time
     from api import _get_engine
     import config as _cfg
@@ -508,13 +828,67 @@ def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
         })
 
     # Step 2: BM25 search
+    # 게이트를 통과했다면 상태는 ready(로드 완료) / absent / deferred / failed다.
+    # deferred(=preimport 실패)일 때만 여기서 lazy 로드가 일어나는데,
+    # 백그라운드 로더와의 이중 로드를 막기 위해 같은 lock을 거쳐 간다.
+    # failed면 재시도하지 않고 건너뛴다 → dense 결과만으로 degrade
+    # (호출자가 _bm25_degraded_notice()로 안내를 덧붙인다).
     t = time.time()
-    try:
-        b_results = eng_obj.bm25_search(query, top_k=_cfg.BM25_TOP_K)
-    except FileNotFoundError:
+    if _BM25_STATE == "failed":
         b_results = []
-    sys.stderr.write(f"[rag] bm25_search {time.time()-t:.2f}s ({len(b_results)} hits)\n")
-    sys.stderr.flush()
+        sys.stderr.write("[rag] bm25 skipped (state=failed) — vector-only\n")
+        sys.stderr.flush()
+    else:
+        # R3 note: 상태가 'loading'이면 _bm25_load_now()가 lock에서 블로킹될 수
+        # 있으나, 현 호출 그래프에서는 _bm25_gate_message()가 'loading'을 이미
+        # 즉답 처리해 여기 도달하지 못한다. 로더 재시작 기능을 추가하면 재검토.
+        # '로드'와 '검색'의 예외는 분리해서 다룬다 (R5). 하나로 묶으면 로드가
+        # 정상 완료(ready)된 뒤 검색 시점에만 터지는 예외까지 state=failed로
+        # latch되어, 이후 영구 벡터 단독 + "BM25 로드 실패" 오귀인이 된다.
+        loaded = False
+        try:
+            _bm25_load_now(eng_obj)
+            # lock을 기다리는 동안 다른 스레드가 failed로 latch했으면
+            # _bm25_load_now()는 예외 없이 조기 반환한다. 이때 검색으로 넘어가면
+            # engine.bm25_search()가 내부 _ensure_bm25()로 실패한 로드를 다시
+            # 통째로 재시도한다(실측: 대기 3s + 재로드 3s). 상태를 다시 확인해
+            # 그대로 vector-only로 빠진다.
+            loaded = _BM25_STATE != "failed"
+            if not loaded:
+                b_results = []
+                sys.stderr.write(
+                    "[rag] bm25 skipped (state=failed, 대기 중 latch됨) — vector-only\n")
+                sys.stderr.flush()
+        except FileNotFoundError:
+            # 인덱스 '부재' — 기존 정책 유지: latch 없이 조용히 vector-only.
+            b_results = []
+        except Exception as e:  # noqa: BLE001
+            # 손상 manifest(json.JSONDecodeError) 등 '부재가 아닌' 로드 실패.
+            # 하드 실패로 벡터 결과까지 버리지 말고 F2의 vector-only degrade로
+            # 흡수한다. state를 failed로 latch해 매 검색마다 전체 로드를
+            # 재시도하지 않게 하고, _bm25_degraded_notice()가 사유를 안내한다.
+            # (latch는 _bm25_load_now()가 lock 안에서 이미 걸었고, 여기서는
+            #  같은 값으로 확정 + 로그만 남긴다.)
+            b_results = []
+            _BM25_STATE = "failed"
+            _BM25_ERROR = f"{type(e).__name__}: {e}"
+            sys.stderr.write(f"[rag] bm25 load failed → vector-only: {_BM25_ERROR}\n")
+            sys.stderr.flush()
+        if loaded:
+            try:
+                b_results = eng_obj.bm25_search(query, top_k=_cfg.BM25_TOP_K)
+            except Exception as e:  # noqa: BLE001
+                # 로드는 멀쩡한데 '이 쿼리'만 실패하는 경우(반쯤 재빌드된
+                # sub-index의 IndexError, 특정 쿼리 토크나이저 오류 등).
+                # 인덱스 전체가 죽은 게 아니므로 latch하지 않는다 — 해당
+                # 쿼리만 vector-only로 넘기고 사유는 stderr에만 기록.
+                b_results = []
+                sys.stderr.write(
+                    f"[rag] bm25_search failed for this query → vector-only "
+                    f"(state 유지={_BM25_STATE}): {type(e).__name__}: {e}\n")
+                sys.stderr.flush()
+        sys.stderr.write(f"[rag] bm25_search {time.time()-t:.2f}s ({len(b_results)} hits)\n")
+        sys.stderr.flush()
 
     # Step 3: RRF + dedup + fetch text for BM25-only candidates
     t = time.time()
@@ -562,9 +936,26 @@ def _hybrid_no_rerank(query: str, top_k: int, where: dict | None) -> list:
 
 def _rag_search_sync(query, top_k, where):
     """블로킹 RAG 검색을 sync 함수로 분리. async tool이 asyncio.to_thread로 호출."""
-    _get_rag_engine()
-    results = _hybrid_no_rerank(query, top_k, where)
-    return _format_rag_results(results)
+    unavailable = _rag_unavailable_reason()
+    if unavailable:
+        return unavailable
+    gated = _bm25_gate_message()
+    if gated:
+        return gated
+    try:
+        _get_rag_engine()
+        results = _hybrid_no_rerank(query, top_k, where)
+    except FileNotFoundError as e:
+        # 인덱스 일부가 실행 도중 사라진 경우 등 — cryptic traceback 대신 안내
+        return (f"RAG 인덱스 파일 없음: {e}\n"
+                "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
+                "정상 사용 가능합니다.\n"
+                "인덱스 재구축은 rag_assembly/indexer.py 참조.")
+    except Exception as e:
+        return (f"RAG 검색 실패: {type(e).__name__}: {e}\n"
+                "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
+                "정상 사용 가능합니다.")
+    return _bm25_degraded_notice() + _format_rag_results(results)
 
 
 @mcp.tool()
@@ -643,8 +1034,18 @@ async def rag_search_documents(query: str, top_k: int = 5,
 @mcp.tool()
 def rag_stats() -> str:
     """RAG 인덱스 현황 (LanceDB 청크 수, 소스별 분포)."""
-    eng = _get_rag_engine()
-    s = _safe_rag_call(eng["stats"])
+    # BM25 게이트를 걸지 않는다 — stats는 LanceDB 카운트만 읽고 BM25를
+    # 건드리지 않으므로, BM25 로딩 중·로드 실패와 무관하게 응답할 수 있다.
+    unavailable = _rag_unavailable_reason()
+    if unavailable:
+        return unavailable
+    try:
+        eng = _get_rag_engine()
+        s = _safe_rag_call(eng["stats"])
+    except Exception as e:
+        return (f"RAG 통계 조회 실패: {type(e).__name__}: {e}\n"
+                "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
+                "정상 사용 가능합니다.")
     out = ["=== rag_assembly 인덱스 현황 ==="]
     out.append(f"LanceDB total chunks: {s['vectordb_count']:,}")
     out.append(f"embed_config_version: {s['embed_config_version']}")
@@ -655,4 +1056,6 @@ def rag_stats() -> str:
 
 
 if __name__ == "__main__":
+    # BM25 로드는 handshake와 분리 — mcp.run() 진입을 막지 않는다.
+    _start_bm25_loader()
     mcp.run()

@@ -1,5 +1,4 @@
 .env
-.mcp.json
 graphrag_workspace/settings.yaml
 graphrag_workspace/.env
 graphrag_workspace/cache/
