@@ -24,10 +24,19 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-def _columns(con, catalog: str, table_name: str) -> set[str]:
+# Any integral width satisfies the `age INTEGER` invariant. Pre-2026-07-26,
+# nine tables carried the API-native `AGE` spelling as VARCHAR, which made a
+# direct `WHERE age >= 20` raise BinderException — see
+# collect/migrations/migrate_age_integer.py.
+_INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+              "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT"}
+
+
+def _columns(con, catalog: str, table_name: str) -> dict[str, str]:
+    """Case-folded column name -> data type."""
     return {
-        r[0].lower() for r in con.execute(
-            "SELECT column_name FROM information_schema.columns "
+        r[0].lower(): r[1] for r in con.execute(
+            "SELECT column_name, data_type FROM information_schema.columns "
             "WHERE table_catalog = ? AND table_name = ?",
             [catalog, table_name],
         ).fetchall()
@@ -75,6 +84,12 @@ def validate(con, raw_catalog: str, analysis_catalog: str, verbose: bool = False
             errors.append(f"{raw_catalog}.{t}: missing `age` column")
             continue
 
+        age_type = cols["age"]
+        if age_type.upper() not in _INT_TYPES:
+            errors.append(
+                f"{raw_catalog}.{t}: `age` must be an INTEGER type, got {age_type}"
+            )
+
         rows = _row_count(con, f'{raw_catalog}."{t}"')
         if rows == 0:
             if verbose:
@@ -100,7 +115,8 @@ def validate(con, raw_catalog: str, analysis_catalog: str, verbose: bool = False
                 errors.append(f"{raw_catalog}.{t}: {spec.age_behavior} has {nulls} NULL ages")
 
         if verbose:
-            print(f"  ok {raw_catalog}.{t} [{spec.age_behavior}] rows={rows:,} null=0")
+            print(f"  ok {raw_catalog}.{t} [{spec.age_behavior}] "
+                  f"rows={rows:,} null=0 age={age_type}")
 
     # Raw side: extracted-text tables
     for required in ("bill_text", "document_text", "speeches"):

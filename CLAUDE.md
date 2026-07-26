@@ -127,7 +127,7 @@ The MCP server at [duckdb_mcp_server.py](duckdb_mcp_server.py) opens `assembly_a
 
 `config.RAW_DB_PATH` and `config.ANALYSIS_DB_PATH` are the canonical Assembly paths. `config.NEWS_DB_PATH` (= `NEWS_RAW_DB_PATH`) and `config.NEWS_ANALYSIS_DB_PATH` are the canonical news paths. `config.DB_PATH` remains as an alias to `ANALYSIS_DB_PATH` for legacy code.
 
-Every per-age table now has a standardized `age INTEGER` column; the per-API derivation rule lives in `config.py::ApiSpec.age_source` and is enforced post-collection by [collect/validate_collection.py](collect/validate_collection.py) (called automatically at the end of `collect/download_all.py`). When making schema-touching changes to the collector, run the validator before committing.
+Every per-age table now has a standardized `age INTEGER` column — literally true since 2026-07-26, when [collect/migrations/migrate_age_integer.py](collect/migrations/migrate_age_integer.py) converted the last 9 tables that were still holding the API-native `AGE` as VARCHAR (they broke a direct `WHERE age >= 20`); the per-API derivation rule lives in `config.py::ApiSpec.age_source` and both the derivation and the INTEGER type are enforced post-collection by [collect/validate_collection.py](collect/validate_collection.py) (called automatically at the end of `collect/download_all.py`). When making schema-touching changes to the collector, run the validator before committing.
 
 ## Common commands
 
