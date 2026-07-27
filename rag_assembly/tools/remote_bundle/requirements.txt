@@ -1,0 +1,17 @@
+# embed_remote.py 단독 실행에 필요한 최소 의존
+# GPU 머신(CUDA 12.x, RTX A5000)용. torch는 CUDA 휠을 먼저 설치할 것 — README 참조.
+#
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# torch를 여기 고정하지 않는 이유: PyPI 기본 인덱스에서 잡히면 CPU 휠이 온다.
+# 반드시 위 CUDA 인덱스로 먼저 설치할 것. cu124 인덱스에 원하는 버전이 없으면
+# cu126(https://download.pytorch.org/whl/cu126)을 쓰되 버전은 항상 고정한다.
+
+sentence-transformers>=3.0.0 # transformers/tokenizers/huggingface-hub 를 함께 끌고 옴
+transformers>=4.41.0         # XLM-R 기반 arctic-embed-l-v2.0 로더
+sentencepiece>=0.1.99        # XLM-R 토크나이저 백엔드 (fast tokenizer 없을 때 필수)
+protobuf>=3.20               # sentencepiece 변환 경로 의존
+pyarrow>=15.0.0              # parquet zstd + FixedSizeList<float16> 쓰기
+numpy>=1.24.0
+huggingface-hub>=0.24.0      # 모델 사전 다운로드(hf / huggingface-cli download)
