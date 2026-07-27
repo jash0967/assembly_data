@@ -71,6 +71,7 @@ def load_kr_bills(ages: Iterable[int] = (19, 20, 21, 22),
         FROM v_kr_bills_analysis
         WHERE primary_attr IS NOT NULL
           AND age IN ({placeholders})
+          AND (is_ai_bill IS NULL OR is_ai_bill = TRUE)
         ORDER BY age, propose_date
     """
 
