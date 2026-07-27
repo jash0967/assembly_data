@@ -4,10 +4,10 @@
 AI 보도 분석의 **데이터 레이어 + 마크다운 리포트 + 출판사 인계 CSV**를 담는다:
 
     1. 보도량 시계열 (월별 추이 + 12개월 이동평균 + 이벤트 마커)
-    2. AI 기본법 통과 전후 윈도우 (±24개월 매체별 월평균 변화)
+    2. AI 기본법 통과 전후 윈도우 (±6개월 매체별 월평균 변화)
     3. 정책 속성 구성 (매체별 / 연도별 — 10속성 Carvão 프레임)
     4. 키워드 추세
-    5. BERTopic 소주제 통계 — **결합 대기** (소주제 재분류 진행 중, 아래 참조)
+    5. BERTopic 소주제 통계 (속성 × 그룹 × 토픽) — curate_subtopics.py 후처리 정본 결합 (§4)
 
 **그림(PNG) 생성은 이 파일이 하지 않는다 — `analyze/make_figures.py`가 전담**한다
 (이 모듈의 `load_*` 데이터 로더를 import해서 작도). 데이터를 갱신한 뒤 그림이
@@ -19,7 +19,7 @@ AI 보도 분석의 **데이터 레이어 + 마크다운 리포트 + 출판사 �
 수집·정화·10속성 GPT 분류는 모두 완료 (76,645건 전량 분류). 분류는
 `news_classifications`의 *현재 버전*(최신 classified_at의
 prompt_version × cleaning_version)만 보고, 커버리지(classified / total)를
-함께 보고한다. 남은 작업은 BERTopic 소주제 재분류뿐 — §5 참조.
+함께 보고한다. 소주제(BERTopic)는 §4 에 결합됨 (load_subtopic_stats).
 
 Public data functions (모두 @lru_cache, 반복 호출 안전):
     load_classification_coverage() -> dict
@@ -31,7 +31,7 @@ Public data functions (모두 @lru_cache, 반복 호출 안전):
     load_attr_by_provider()        -> (providers, attrs_en, count_matrix)
     load_attr_by_year()            -> (years, attrs_en, share_matrix)
     load_keyword_trend(keywords)   -> dict[keyword, list[(yyyymm, hits)]]
-    load_subtopic_stats()          -> None   # 결합 대기: BERTopic 소주제 재분류 중
+    load_subtopic_stats()          -> dict   # 큐레이션된 속성 × 그룹 × 토픽 소주제 통계
 
 CLI:
     python analyze/news_descriptive.py --summary   # 콘솔 요약
@@ -290,7 +290,7 @@ def load_provider_year_matrix() -> tuple[list[str], list[int], list[list[int]]]:
 
 
 @lru_cache(maxsize=8)
-def load_event_window(event_date: str = AIBASIC_DATE, months: int = 24) -> dict:
+def load_event_window(event_date: str = AIBASIC_DATE, months: int = 6) -> dict:
     """이벤트 전후 ±N개월 매체별 월평균 보도량 변화 (그림6).
 
     월평균 = 윈도우 내 합계 / 윈도우 내 '데이터가 존재하는 달 수'. (데이터 범위
@@ -531,15 +531,61 @@ def load_keyword_trend(
 # 5. BERTopic 소주제 — 결합 대기 (소주제 재분류 진행 중)
 # ──────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=1)
 def load_subtopic_stats():
-    """[결합 대기] BERTopic 소주제 통계.
+    """큐레이션된 BERTopic 소주제 통계 (속성 × 그룹 × 토픽).
 
-    수집·정화·10속성 분류는 완료됐고, 남은 작업은 BERTopic 소주제 재분류뿐이다.
-    analyze/subtopic_bertopic.py가 결과를 news_analysis.duckdb::subtopic_assignments
-    (attr × article_id × topic_id)에 쓰지만, 토픽 구성이 아직 확정 전이라 이 절은
-    결합을 보류한다. 소주제가 확정되면 여기서 그 테이블을 읽어 (속성 × 소주제 ×
-    시기) 통계로 결합한다. 현재는 미결합 — None 반환."""
-    return None
+    출처: output/analysis/subtopics_bertopic.json (수작업 후처리 정본 — 비-AI·stage-1
+    오탐 토픽 삭제 + 근접 토픽 그룹 통합 반영; analyze/curate_subtopics.py 참조).
+    토픽 정의·group_id·라벨·count 를 읽어 속성별 그룹(▣ 묶음 / · 단독) 구조로 집계.
+    count 는 클러스터링 시점 값(= subtopic_assignments 와 일치).
+
+    반환: {"attrs":[{attr, n_topics, n_groups, clustered, outliers,
+                     groups:[{label, total, is_multi, members:[{label,count}]}]}],
+           total_topics, total_groups, total_clustered, total_outliers}  | None(부재)."""
+    import json
+    from collections import defaultdict
+    path = os.path.join(config.ANALYSIS_DIR, "subtopics_bertopic.json")
+    if not os.path.exists(path):
+        return None
+    d = json.load(open(path, encoding="utf-8"))
+    order = ["AI안전", "책임/윤리AI", "산업정책", "공익/소비자보호", "국가안보",
+             "선거/민주주의", "시장경쟁/독과점", "노동/고용", "저작권/지식재산", "국제협력"]
+    seq = order + [a for a in d if a not in order]
+    out = {"attrs": [], "total_topics": 0, "total_groups": 0,
+           "total_clustered": 0, "total_outliers": 0}
+
+    def _lab(t):
+        return t.get("label_ko", "") or ", ".join(t.get("keywords", [])[:4]) or f"t{t['topic_id']}"
+
+    for attr in seq:
+        info = d.get(attr)
+        if not isinstance(info, dict) or "topics" not in info:
+            continue
+        g = defaultdict(list)
+        for t in info["topics"]:
+            g[t.get("group_id", t["topic_id"])].append(t)
+        groups = []
+        for ts in g.values():
+            ts = sorted(ts, key=lambda x: -x.get("count", 0))
+            total = sum(t.get("count", 0) for t in ts)
+            if len(ts) > 1:
+                label = next((t.get("group_label_ko") for t in ts if t.get("group_label_ko")), _lab(ts[0]))
+            else:
+                label = _lab(ts[0])
+            groups.append({"label": label, "total": total, "is_multi": len(ts) > 1,
+                           "members": [{"label": _lab(t), "count": t.get("count", 0)} for t in ts]})
+        groups.sort(key=lambda x: -x["total"])
+        clustered = sum(grp["total"] for grp in groups)
+        outliers = info.get("n_outliers", 0)
+        out["attrs"].append({"attr": attr, "n_topics": info.get("n_topics", len(info["topics"])),
+                             "n_groups": info.get("n_groups", len(groups)),
+                             "clustered": clustered, "outliers": outliers, "groups": groups})
+        out["total_topics"] += info.get("n_topics", 0)
+        out["total_groups"] += info.get("n_groups", 0)
+        out["total_clustered"] += clustered
+        out["total_outliers"] += outliers
+    return out if out["attrs"] else None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -596,8 +642,8 @@ def src_decade_trend() -> str:
 
 
 def src_event_window() -> str:
-    """그림: news_event_window → 매체별 AI기본법 ±24개월 전/후 월평균·변화율."""
-    win = load_event_window(AIBASIC_DATE, 24)
+    """그림: news_event_window → 매체별 AI기본법 ±6개월 전/후 월평균·변화율."""
+    win = load_event_window(AIBASIC_DATE, 6)
     rows = []
     for p in PROVIDER_ORDER:
         if p in win["providers"]:
@@ -643,6 +689,15 @@ def src_attr_year_trend() -> str:
          "share_excl_none_pct"], rows)
 
 
+def src_attr_composition() -> str:
+    """그림: news_attr_composition → 전 매체 합산 속성 구성(트리맵 원자료, none 제외)."""
+    rows = [[a, kr(a), c, round(s, 2)]
+            for a, c, s in load_attr_distribution() if a != "none"]
+    return _write_csv(
+        "news_attr_composition.csv",
+        ["attribute_en", "attribute_kr", "count", "share_excl_none_pct"], rows)
+
+
 def _write_source_manifest(coverage: dict) -> str:
     """출판사 인계 README — 각 CSV ↔ 그림 ↔ 컬럼 설명."""
     dmin = coverage["date_min"].strftime("%Y-%m") if coverage["date_min"] else "?"
@@ -664,9 +719,10 @@ def _write_source_manifest(coverage: dict) -> str:
         "| CSV | 그림 | 내용 |",
         "|---|---|---|",
         "| `news_decade_trend.csv` | 월별 보도 추이 | month, 월별 보도량, 12개월 이동평균 |",
-        "| `news_event_window.csv` | AI 기본법 ±24개월 | 매체별 전/후 월평균·변화율(%) (마지막 행=전체) |",
-        "| `news_provider_attr.csv` | 매체별 속성 구성 | (매체×속성) long, count + 미분류제외 share(%) |",
+        "| `news_event_window.csv` | AI 기본법 ±6개월 | 매체별 전/후 월평균·변화율(%) (마지막 행=전체) |",
+        "| `news_attr_composition.csv` | 전체 속성 구성(트리맵) | (속성) count + 미분류제외 share(%) |",
         "| `news_attr_year_trend.csv` | 연도별 속성 추세 | (연도×속성) long, count + 미분류제외 share(%) |",
+        "| `news_provider_attr.csv` | 매체별 속성 구성(참고) | (매체×속성) long, count + 미분류제외 share(%) — 본문 그림은 트리맵 대체 |",
         "\n## 공통 주석\n",
         "- `share_excl_none_pct`: 미분류(none)를 분모에서 제외한 비중(%).",
         "- 속성 라벨: `attribute_en`(Carvão 정본 영문) ↔ `attribute_kr`(보고서 한글).",
@@ -682,8 +738,8 @@ def _write_source_manifest(coverage: dict) -> str:
 def export_figure_sources() -> list[str]:
     """모든 그림의 원자료 CSV + 매니페스트를 config.FIGURES_SOURCE_DIR에 생성."""
     paths = []
-    for fn in (src_decade_trend, src_event_window, src_provider_attr,
-               src_attr_year_trend):
+    for fn in (src_decade_trend, src_event_window, src_attr_composition,
+               src_attr_year_trend, src_provider_attr):
         try:
             p = fn()
             paths.append(p)
@@ -761,8 +817,8 @@ def build_report() -> str:
     L.append("")
 
     # 2. AI 기본법 윈도우
-    L.append("## 2. AI 기본법 통과 전후 (±24개월)\n")
-    win = load_event_window(AIBASIC_DATE, 24)
+    L.append("## 2. AI 기본법 통과 전후 (±6개월)\n")
+    win = load_event_window(AIBASIC_DATE, 6)
     ov = win["overall"]
     L.append(f"- 전체 월평균 {ov['before_avg']:.0f} → {ov['after_avg']:.0f}건/월 "
              f"(**{ov['pct']:+.1f}%**)")
@@ -788,19 +844,44 @@ def build_report() -> str:
             sval = "—" if a == "none" else f"{s:.1f}%"
             L.append(f"| {kr(a)} | {c:,} | {sval} |")
         L.append("")
-        L.append("### 3.2 매체별·연도별 구성\n")
-        L.append(_fig_embed("report41c_kr_attributes.png", "매체별·연도별 속성"))
+        L.append("### 3.2 속성 구성 트리맵 (전 매체 합산)\n")
+        L.append(_fig_embed("report41c_kr_attr_treemap.png", "속성 구성 트리맵"))
+        L.append("")
+        L.append("### 3.3 연도별 속성 추세\n")
+        L.append(_fig_embed("report41d_kr_attr_year.png", "연도별 속성 추세"))
         L.append("")
     else:
         L.append("> 분류 데이터 없음 (재분류 초기 상태).\n")
 
-    # 4. BERTopic — 소주제 재분류 진행 중
-    L.append("## 4. 소주제 분석 (BERTopic) — 결합 대기\n")
-    L.append("> 수집·정화·10속성 분류는 완료됐고, **남은 작업은 BERTopic 소주제 "
-             "재분류뿐이다.** `analyze/subtopic_bertopic.py`가 결과를 "
-             "`subtopic_assignments` 테이블에 쓰지만 토픽 구성이 아직 확정 전이라 "
-             "이 절은 결합을 보류한다. 확정 후 속성별 소주제·분기별 Top-10 동적 "
-             "랭킹을 결합한다. `load_subtopic_stats()` 참조.\n")
+    # 4. BERTopic 소주제 (curate_subtopics.py 후처리 정본)
+    st = load_subtopic_stats()
+    L.append("## 4. 소주제 분석 (BERTopic)\n")
+    if not st:
+        L.append("> 소주제 결과 없음 (`output/analysis/subtopics_bertopic.json` 부재).\n")
+    else:
+        L.append("> 방법: SBERT(bge-m3) 임베딩 → cuML UMAP·HDBSCAN(deterministic) 클러스터링 "
+                 "→ GPT centroid 라벨링 → centroid 평균연결 그룹화. KO 단독 분류. "
+                 "수작업 후처리(`analyze/curate_subtopics.py`)로 비-AI·stage-1 오탐 토픽을 "
+                 "삭제하고 근접 토픽을 묶음 그룹으로 통합했다.\n")
+        L.append(f"- 분석 대상: 토픽 분류 **{st['total_clustered']:,}건** "
+                 f"(+ 미분류 아웃라이어 {st['total_outliers']:,}건) · "
+                 f"10속성 **{st['total_topics']}토픽 · {st['total_groups']}그룹**")
+        L.append("- '상위 묶음' = 속성 내 기사수 상위 그룹(▣ 묶음/· 단독), 괄호는 속성 내 비중. "
+                 "그룹별 상세는 `output/article_lists_ko.md` 참조.\n")
+        L.append("| 속성 | 토픽 | 그룹 | 분류 | 아웃 | 상위 묶음 (속성 내 비중) |")
+        L.append("|---|--:|--:|--:|--:|---|")
+        for a in st["attrs"]:
+            cl = a["clustered"] or 1
+            parts = []
+            for g in a["groups"][:3]:
+                lab = g["label"]
+                lab = (lab[:17] + "…") if len(lab) > 18 else lab
+                parts.append(f"{lab} {100 * g['total'] / cl:.0f}%")
+            more = len(a["groups"]) - 3
+            tail = f" …외 {more}" if more > 0 else ""
+            L.append(f"| {a['attr']} | {a['n_topics']} | {a['n_groups']} | "
+                     f"{a['clustered']:,} | {a['outliers']:,} | {' · '.join(parts)}{tail} |")
+        L.append("")
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(config.OUTPUT_DIR, "news_analysis.md")
@@ -835,9 +916,9 @@ def _print_summary() -> None:
         print(f"  {p:<10} {n:>10,}")
     print()
 
-    win = load_event_window(AIBASIC_DATE, 24)
+    win = load_event_window(AIBASIC_DATE, 6)
     ov = win["overall"]
-    print(f"AI 기본법 ±24개월: {ov['before_avg']:.0f} → {ov['after_avg']:.0f}/월 "
+    print(f"AI 기본법 ±6개월: {ov['before_avg']:.0f} → {ov['after_avg']:.0f}/월 "
           f"({ov['pct']:+.1f}%)" + ("  [부분 윈도우]" if win["partial"] else ""))
     print()
 

@@ -7,7 +7,7 @@ Usage:
     python subtopic_bertopic.py --attr 책임/윤리AI
     python subtopic_bertopic.py
 """
-import json, os, sys, time, html as html_mod, re, argparse, hashlib
+import json, os, sys, time, html as html_mod, re, argparse, hashlib, math
 from collections import Counter
 
 if sys.stdout.encoding != "utf-8":
@@ -120,6 +120,27 @@ USE_KEYBERT_REPRESENTATION = True
 # HDBSCAN 토픽 선택 방식: "leaf"(잘게 쪼갬, 기본) / "eom"(안정적 상위 클러스터, 토픽 적음).
 # --cluster-method 로 조정. eom 은 작은 EN 데이터에서 거대 컨테이너 위험(실측 확인됨).
 CLUSTER_SELECTION_METHOD = "leaf"
+
+# ── 속성별 min_cluster_size 함수 (거대 컨테이너 분해, 2026-06-01 재calibration) ──
+# 단일 함수(sqrt×0.6)는 공익 58%·AI안전 52%·국가 38% 등 거대 컨테이너를 못 깬다.
+# working/calibrate_mcs.py 로 8함수×10속성 sweep 후, 속성별로 max%(1위 토픽 비중)를
+# 낮추면서 outlier 폭증·과편화를 피하고 top 토픽이 on-theme 인 함수를 선택.
+# 근거·전체 매트릭스: working/calibration_history.md, working/mcs_calibration.json.
+# ⚠ 산업·공익·책임·선거는 cuML 비결정성으로 재실행 시 결과 변동 가능(working/finding_cluster_stability.md).
+# 책임/윤리AI 는 현행 sqrt×0.6 이 이미 max 15%·최저 outlier 라 유지(거대 컨테이너 없음).
+_DEFAULT_MCS = lambda n: max(8, math.ceil(0.6 * math.sqrt(n)))
+ATTR_MCS = {
+    '산업정책':        lambda n: max(8, math.ceil(0.5 * math.sqrt(n))),        # sqrt×0.5 → 69t max11%
+    '공익/소비자보호':  lambda n: max(8, math.ceil(10 * math.log10(max(n, 10)))),  # log10×10 → 38t max16%
+    '국가안보':        lambda n: max(8, n // 200),                            # linear   → 38t max30%
+    '노동/고용':       lambda n: max(8, math.ceil(3 * n ** (1/3))),           # cbrt×3   → 21t max19%
+    '책임/윤리AI':     _DEFAULT_MCS,                                          # sqrt×0.6 유지(이미 양호)
+    '시장경쟁/독과점':  lambda n: max(8, math.ceil(3 * n ** (1/3))),           # cbrt×3   → 24t max7%
+    '국제협력':        lambda n: max(8, n // 200),                            # linear   → 38t max10%
+    '선거/민주주의':    lambda n: max(8, math.ceil(10 * math.log10(max(n, 10)))),  # log10×10 → 13t max10%
+    'AI안전':         lambda n: max(8, math.ceil(15 * math.log10(max(n, 10)))),  # log10×15 → 8t max14%
+    '저작권/지식재산':  lambda n: max(8, n // 200),                            # linear   → 33t max6%
+}
 
 BASE_STOPWORDS = [
     'ai','AI','A.I','A.I.','Ai','artificial','intelligence','the','and','for','that','with',
@@ -414,9 +435,8 @@ def run_bertopic_lang(texts, sources, attr, sbert, lang_tag):
     embeddings = embed_texts(texts, attr, sbert, lang_tag)
 
     stopwords = BASE_STOPWORDS + ATTR_EXTRA_STOPWORDS.get(attr, [])
-    # BGE-M3 응집 강해 mcs 공식·min_samples·cluster_selection_method 재튜닝 (2026-05-24)
-    import math
-    mcs        = max(8, math.ceil(0.6 * math.sqrt(n)))
+    # 속성별 mcs (ATTR_MCS, 2026-06-01 재calibration). 미등록 속성은 sqrt×0.6 기본.
+    mcs        = ATTR_MCS.get(attr, _DEFAULT_MCS)(n)
     n_comp     = 10 if n > 800 else 5
     n_neigh    = 15
 
@@ -1117,6 +1137,10 @@ def run_group_topics(threshold):
     with open(OUTPUT, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n저장(그룹 갱신): {OUTPUT}")
+
+    from export_subtopic_lists import write_ko_lists, write_combined_lists
+    write_ko_lists(OUTPUT, os.path.join(config.OUTPUT_DIR, "article_lists_ko.md"))
+    write_combined_lists(OUTPUT, os.path.join(config.OUTPUT_DIR, "article_lists_by_subtopic.md"))
 
 
 def resolve_cluster_backend(requested, cuda_available):
