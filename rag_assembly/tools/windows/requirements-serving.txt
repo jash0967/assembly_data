@@ -1,0 +1,94 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# duckdb_mcp_server.py — Windows "서빙 전용" 의존성 (2026-07-27)
+#
+# 범위: MCP 서버가 stdio로 뜨고, DuckDB 도구 4종 + RAG 도구 6종이 도는 데
+#       필요한 것만. 인덱스 빌드·임베딩 대량 생성·수집·분류는 **제외**
+#       (그 작업들은 WSL에서만 한다 — SETUP_WINDOWS.md §9 참조).
+#
+# 산정 근거: 서빙 경로를 실제로 import 해서 얻은 목록.
+#   duckdb_mcp_server.py
+#     → mcp.server.fastmcp, duckdb, bm25s
+#     → rag_assembly/api.py → search.py → {bm25, embedder, reranker, vectordb}.py
+#     → rag_assembly/config.py 가 저장소 루트 config.py 를 exec (→ dotenv)
+#     → 질의 시점: embedder → torch + sentence_transformers
+#
+# 설치 순서 (순서가 중요하다):
+#   1) torch 를 **먼저** CUDA 인덱스에서 설치.  아래 [torch] 절 참조.
+#      이 파일을 먼저 돌리면 sentence-transformers 가 PyPI의 **CPU 전용** torch를
+#      끌어와 GPU를 못 쓴다.
+#   2) pip install -r requirements-serving.txt
+#      (torch==2.12.0 은 이미 설치된 2.12.0+cu130 으로 충족된다 — PEP 440에서
+#       local version `+cu130` 은 `==2.12.0` 을 만족한다. 재설치되지 않는다.)
+#
+# Python 버전:
+#   권장 3.12 (WSL 정본과 동일: 3.12.3). 3.11 / 3.13 도 가능.
+#   ⚠ 3.14 는 쓰지 말 것 — numpy 2.2.6 에 cp314 win_amd64 휠이 없어
+#     소스 빌드로 떨어진다(실측: PyPI 파일 목록 cp310~cp313 + py3).
+#   ⚠ 다른 앱의 venv 안에 있는 Python 을 재사용하지 말 것. 전용 venv 신설.
+#
+# 버전 고정 정책:
+#   WSL 정본 venv에서 실제로 도는 버전을 == 로 못박았다. 인덱스(LanceDB 포맷,
+#   bm25s 파일 포맷, pickle protocol 5)를 읽는 쪽이라 판 버전이 어긋나면
+#   조용히 깨질 수 있는 자리다. 올릴 때는 WSL 쪽을 먼저 올리고 재검증할 것.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── [torch] GPU 휠 — 이 파일 실행 **전에** 별도로 설치 ──────────────────────
+# RTX 4060 (sm_89) / CUDA 13.0 빌드, WSL 정본과 동일:
+#
+#   pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130
+#
+#   (검증 2026-07-27: download.pytorch.org/whl/cu130 에 torch-2.12.0 의
+#    win_amd64 cp310/cp311/cp312/cp313/cp314 휠 존재)
+#
+# GPU 없이/드라이버 문제로 CPU만 쓸 경우:
+#
+#   pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+#
+#   CPU 폴백은 코드에 이미 있다 (embedder.py::load_model — CUDA 로드 실패 시
+#   자동 CPU 재시도). 질의 1건 임베딩이 GPU 대비 수 배 느려질 뿐 결과는 같다.
+#   강제하려면 env RAG_EMBED_DEVICE=cpu.
+torch==2.12.0
+
+# ── MCP 서버 본체 ────────────────────────────────────────────────────────────
+mcp==1.27.1                    # duckdb_mcp_server.py: from mcp.server.fastmcp import FastMCP
+duckdb==1.5.3                  # DuckDB 도구 + ATTACH (raw/news_analysis/news_raw)
+python-dotenv==1.2.2           # 저장소 루트 config.py 의 load_dotenv().
+                               # rag_assembly/config.py::_repo_root_db_paths() 가
+                               # 루트 config.py 를 exec 하므로 서빙에서도 필수다.
+
+# ── RAG 검색 (벡터) ──────────────────────────────────────────────────────────
+lancedb==0.30.2                # vectordb.py — LanceDB 테이블 오픈·질의
+pyarrow==24.0.0                # vectordb.py / bm25.py
+numpy==2.2.6                   # embedder.py / vectordb.py
+
+# ── RAG 검색 (BM25 + 한국어 형태소) ──────────────────────────────────────────
+bm25s==0.3.9                   # bm25.py — 13개 sub-index load/search
+kiwipiepy==0.23.1              # bm25.py — 질의 토크나이즈 (Kiwi)
+kiwipiepy_model==0.23.0        # kiwipiepy 가 자동으로 끌어오지만 버전을 못박는다
+
+# ── 질의 임베딩 (arctic-embed-l-v2.0-ko) ─────────────────────────────────────
+sentence-transformers==5.5.1   # embedder.py (+ reranker.py — MCP 경로에서는 비활성)
+
+# ── 간접 의존이지만 고정 (모델 로딩 스택은 판 갈이에 민감) ───────────────────
+transformers==5.9.0
+tokenizers==0.22.2
+huggingface_hub==1.16.1
+safetensors==0.7.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 자동으로 딸려오는 것 (직접 적지 않음):
+#   scipy, scikit-learn, pandas, pillow, joblib, tqdm, filelock, regex,
+#   pydantic, anyio, httpx, starlette, uvicorn, sympy, mpmath, packaging …
+#
+# 일부러 뺀 것 (= 이게 필요하면 그 작업은 Windows에서 하면 안 되는 작업이다):
+#   google-genai, google-cloud-aiplatform … 옛 Vertex 임베딩. 로컬 모델 전환으로 사망.
+#   chromadb, rank-bm25 ................... 옛 벡터·BM25 백엔드. 현재 코드 미사용.
+#   PyMuPDF(fitz), pyhwp, bs4, lxml ....... 문서 추출 = 수집 파이프라인(collect/).
+#   requests, openai ...................... Open API 수집 + 분류(analyze/).
+#   bertopic, umap-learn, hdbscan, cuml ... 소주제 분석(analyze/).
+#   matplotlib ............................ 그림 생성(analyze/make_figures.py).
+#   pytest ................................ 없음(이 저장소엔 테스트 스위트 자체가 없다).
+#
+# sentencepiece 를 넣지 않은 이유: 이 모델 스냅샷에 tokenizers 용 tokenizer.json
+# 이 있어 fast tokenizer 로 로드된다 (transformers 의 sentencepiece 는 extra).
+# ─────────────────────────────────────────────────────────────────────────────

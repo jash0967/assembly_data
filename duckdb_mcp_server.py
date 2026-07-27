@@ -12,9 +12,55 @@ RAG 통합 stdout 보호:
   huggingface_hub 등이 stdout에 progress·warning을 직접 print해서 protocol
   깨질 수 있음. (1) 환경변수로 progress bar 차단, (2) 노이즈 모듈을
   FastMCP 시작 전에 미리 import해서 startup 노이즈가 mcp.run() 전에 끝나도록.
+
+경로 환경변수 (§정본 문서 — 2026-07-27 추가):
+  데이터·인덱스를 저장소 밖(다른 드라이브·다른 OS)에 두고 서빙할 수 있도록
+  아래 변수로 경로를 덮어쓸 수 있다. **하나도 설정하지 않으면 기존과 완전히
+  동일한 경로**(저장소 기준 상대 위치)를 쓴다.
+
+    ASSEMBLY_DATA_DIR               data/ 루트. 아래 4개 DB의 기본 부모.
+                                    (data/bills_kr, data/news 하위 구조는 유지)
+    ASSEMBLY_RAW_DB_PATH            assembly_raw.duckdb        (파일)
+    ASSEMBLY_ANALYSIS_DB_PATH       assembly_analysis.duckdb   (파일)
+    ASSEMBLY_NEWS_RAW_DB_PATH       news.duckdb                (파일)
+    ASSEMBLY_NEWS_ANALYSIS_DB_PATH  news_analysis.duckdb       (파일)
+    RAG_DATA_DIR                    RAG 인덱스 루트 (lance_db/ · bm25/ ·
+                                    manifest.sqlite · embed_config.json 의 부모).
+                                    rag_assembly/config.py 가 **같은 변수를 같은
+                                    규칙으로** 읽으므로 서버 진단과 실제 검색
+                                    경로가 갈라지지 않는다.
+
+  명명 규칙: 이 모듈의 경로 상수 이름 앞에 `ASSEMBLY_` 를 붙인 것
+  (RAW_DB_PATH → ASSEMBLY_RAW_DB_PATH). RAG 인덱스만 rag_assembly 네임스페이스를
+  따라 `RAG_` (같은 폴더의 RAG_EMBED_DEVICE 와 동일 계열).
+  개별 DB 변수가 ASSEMBLY_DATA_DIR 보다 우선한다. 값은 ~ 와 $VAR/%VAR% 확장 후
+  절대경로화된다. 상대경로는 프로세스 CWD 기준이라 권장하지 않는다.
+  시작 시 각 경로의 존재 여부를 stderr 한 줄씩 진단 출력한다
+  (`python duckdb_mcp_server.py --paths` 로 서버를 띄우지 않고 확인 가능).
+
+  그 밖의 동작 환경변수: MCP_BM25_LOAD_DELAY, MCP_EMBED_WARMUP,
+  MCP_EMBED_SUBPROC, RAG_EMBED_DEVICE.
+
+Windows에서 서빙할 때 (2026-07-27):
+  - `PYTHONUTF8=1` 을 권장한다. 이 파일은 stderr를 UTF-8로 고정하고
+    _subproc_embed.py 도 stdin/stdout을 UTF-8로 고정하지만, 서드파티가 여는
+    파일까지는 보장할 수 없다 (cp949 기본 인코딩 사고 예방).
+  - stdout(JSON-RPC)은 mcp SDK가 sys.stdout.buffer를 UTF-8 TextIOWrapper로
+    직접 감싸므로 로케일과 무관하다.
+  - BM25 **빌드**(bm25.py::build)는 multiprocessing fork 전제라 Windows에서
+    쓰지 않는다. 서빙(load/search)은 fork를 쓰지 않으므로 무관.
 """
 import os
 import sys
+
+# Windows(cp949 로케일)에서 한국어·기호가 섞인 진단 로그가 UnicodeEncodeError를
+# 내며 스레드를 죽이는 것을 막는다. stderr만 손댄다 — stdout은 FastMCP가
+# sys.stdout.buffer를 직접 감싸 protocol 채널로 쓰므로 절대 건드리지 않는다.
+# (Linux/UTF-8 환경에서는 사실상 no-op.)
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001 — 진단 채널 설정 실패가 서버를 막으면 안 된다
+    pass
 
 # (1) 진행률·로그 출력 차단 (FastMCP import 전에 설정해야 효과)
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -89,12 +135,34 @@ import duckdb
 from mcp.server.fastmcp import FastMCP
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_BILLS_KR_DIR = os.path.join(_REPO_ROOT, "data", "bills_kr")
-_NEWS_DIR     = os.path.join(_REPO_ROOT, "data", "news")
-RAW_DB_PATH           = os.path.join(_BILLS_KR_DIR, "assembly_raw.duckdb")
-ANALYSIS_DB_PATH      = os.path.join(_BILLS_KR_DIR, "assembly_analysis.duckdb")
-NEWS_RAW_DB_PATH      = os.path.join(_NEWS_DIR, "news.duckdb")
-NEWS_ANALYSIS_DB_PATH = os.path.join(_NEWS_DIR, "news_analysis.duckdb")
+
+
+def _env_path(var: str, default: str) -> str:
+    """경로 환경변수 해석. 미설정·빈 값이면 default (= 기존 동작 그대로).
+
+    설정 시 ~ 와 $VAR/%VAR% 를 확장한 뒤 os.path.abspath 로 정규화한다
+    (Windows 드라이브 문자·역슬래시 안전). 조립은 전부 os.path.join 이므로
+    구분자를 하드코딩하지 않는다.
+    rag_assembly/config.py::_resolve_data_dir() 과 규칙이 같아야 한다.
+    """
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return os.path.abspath(default)
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(raw)))
+
+
+# data/ 루트 — 개별 DB 변수가 이것보다 우선한다.
+_DATA_DIR     = _env_path("ASSEMBLY_DATA_DIR", os.path.join(_REPO_ROOT, "data"))
+_BILLS_KR_DIR = os.path.join(_DATA_DIR, "bills_kr")
+_NEWS_DIR     = os.path.join(_DATA_DIR, "news")
+RAW_DB_PATH           = _env_path(
+    "ASSEMBLY_RAW_DB_PATH", os.path.join(_BILLS_KR_DIR, "assembly_raw.duckdb"))
+ANALYSIS_DB_PATH      = _env_path(
+    "ASSEMBLY_ANALYSIS_DB_PATH", os.path.join(_BILLS_KR_DIR, "assembly_analysis.duckdb"))
+NEWS_RAW_DB_PATH      = _env_path(
+    "ASSEMBLY_NEWS_RAW_DB_PATH", os.path.join(_NEWS_DIR, "news.duckdb"))
+NEWS_ANALYSIS_DB_PATH = _env_path(
+    "ASSEMBLY_NEWS_ANALYSIS_DB_PATH", os.path.join(_NEWS_DIR, "news_analysis.duckdb"))
 # 호환용 alias
 DB_PATH = ANALYSIS_DB_PATH
 
@@ -104,20 +172,51 @@ mcp = FastMCP("assembly-db")
 _CATALOGS = ("assembly_analysis", "raw", "news_analysis", "news_raw")
 
 
+_ATTACH_ENV = {
+    "raw": "ASSEMBLY_RAW_DB_PATH",
+    "news_analysis": "ASSEMBLY_NEWS_ANALYSIS_DB_PATH",
+    "news_raw": "ASSEMBLY_NEWS_RAW_DB_PATH",
+}
+_ATTACH_WARNED: set[str] = set()   # 경고는 alias당 1회 (호출마다 도배 금지)
+
+
 def _open() -> duckdb.DuckDBPyConnection:
     """analysis DB를 read-only로 열고 raw + 뉴스 두 DB를 ATTACH.
 
     같은 process에서 _open()이 여러 번 호출될 때 storage manager가
     "이미 등록됨" BinderException을 던지는 경우가 있으므로 attach는 idempotent.
+
+    경로가 잘못 지정된 경우(다른 드라이브·부분 복사 등):
+      - 메인(analysis)이 없으면 어느 도구도 못 쓰므로 고칠 환경변수를 알려주며 실패.
+      - ATTACH 대상이 없으면 그 카탈로그만 빼고 연다 — 셋 중 하나가 빠졌다고
+        나머지 DuckDB 도구까지 죽이지 않는다 (stderr에 1회 경고).
+    파일이 모두 제자리인 기본 상태에서는 아래 경로가 전부 no-op이다.
     """
+    if not os.path.isfile(ANALYSIS_DB_PATH):
+        raise RuntimeError(
+            f"analysis DB 파일이 없습니다: {ANALYSIS_DB_PATH}\n"
+            "환경변수 ASSEMBLY_ANALYSIS_DB_PATH (또는 data/ 통째로 옮겼다면 "
+            "ASSEMBLY_DATA_DIR) 로 실제 위치를 지정하세요.")
     con = duckdb.connect(ANALYSIS_DB_PATH, read_only=True)
     for path, alias in (
         (RAW_DB_PATH, "raw"),
         (NEWS_ANALYSIS_DB_PATH, "news_analysis"),
         (NEWS_RAW_DB_PATH, "news_raw"),
     ):
+        if not os.path.isfile(path):
+            if alias not in _ATTACH_WARNED:
+                _ATTACH_WARNED.add(alias)
+                sys.stderr.write(
+                    f"[mcp] ATTACH 생략 — {alias} DB 파일 없음: {path} "
+                    f"→ 환경변수 {_ATTACH_ENV[alias]} 로 지정\n")
+                sys.stderr.flush()
+            continue
+        # 경로는 SQL 문자열 리터럴로 들어가므로 작은따옴표만 escape한다.
+        # (역슬래시는 DuckDB 표준 문자열에서 escape 문자가 아니라 Windows 경로가
+        #  그대로 안전하다 — 여기서 구분자를 바꾸지 말 것.)
+        lit = path.replace("'", "''")
         try:
-            con.execute(f"ATTACH '{path}' AS {alias} (READ_ONLY)")
+            con.execute(f"ATTACH '{lit}' AS {alias} (READ_ONLY)")
         except duckdb.BinderException:
             # 이미 attached (DuckDB의 같은-파일 storage manager 중복 등록 방지)
             pass
@@ -381,12 +480,56 @@ _rag_engine = None
 # RAG 인덱스 실물 경로 (rag_assembly/config.py의 DATA_DIR·BM25_PKL·LANCE_DIR와 대응).
 # BM25Index.__init__은 cfg.BM25_PKL의 '.pkl' 접미사를 떼고 디렉터리로 쓰므로
 # 실제 root는 data/bm25 — 접미사 유무 양쪽 다 인정한다.
-_RAG_DATA_DIR = os.path.join(_REPO_ROOT, "rag_assembly", "data")
+# RAG_DATA_DIR 은 rag_assembly/config.py 가 읽는 것과 **같은 변수·같은 규칙**이다
+# (여기만 바뀌면 진단과 실제 검색 경로가 갈라진다).
+_RAG_DATA_DIR = _env_path("RAG_DATA_DIR",
+                          os.path.join(_REPO_ROOT, "rag_assembly", "data"))
 _RAG_BM25_MANIFESTS = (
     os.path.join(_RAG_DATA_DIR, "bm25", "manifest.json"),
     os.path.join(_RAG_DATA_DIR, "bm25.pkl", "manifest.json"),
 )
 _RAG_LANCE_TABLE = os.path.join(_RAG_DATA_DIR, "lance_db", "chunks.lance")
+
+
+# ── 경로 진단 (startup stderr 1줄/경로) ────────────────
+# 데이터를 저장소 밖에 두고 서빙할 때 "왜 안 보이는지"를 즉시 알려준다.
+# stdout에는 절대 쓰지 않는다 (JSON-RPC 채널).
+
+def _path_diagnostics() -> list[str]:
+    """해석된 경로 × 존재 여부 × 고칠 환경변수 이름 (한 경로당 한 줄)."""
+    def _any_exists(_p: str) -> bool:
+        return any(os.path.exists(q) for q in _RAG_BM25_MANIFESTS)
+
+    rows = (
+        ("analysis_db",         ANALYSIS_DB_PATH,       "ASSEMBLY_ANALYSIS_DB_PATH",      os.path.isfile),
+        ("raw_db",              RAW_DB_PATH,            "ASSEMBLY_RAW_DB_PATH",           os.path.isfile),
+        ("news_analysis_db",    NEWS_ANALYSIS_DB_PATH,  "ASSEMBLY_NEWS_ANALYSIS_DB_PATH", os.path.isfile),
+        ("news_raw_db",         NEWS_RAW_DB_PATH,       "ASSEMBLY_NEWS_RAW_DB_PATH",      os.path.isfile),
+        ("rag_data_dir",        _RAG_DATA_DIR,          "RAG_DATA_DIR",                   os.path.isdir),
+        ("rag_bm25_manifest",   _RAG_BM25_MANIFESTS[0], "RAG_DATA_DIR",                   _any_exists),
+        ("rag_lance_table",     _RAG_LANCE_TABLE,       "RAG_DATA_DIR",                   os.path.isdir),
+    )
+    out = []
+    for label, path, var, check in rows:
+        try:
+            ok = bool(check(path))
+        except OSError:
+            ok = False
+        if ok:
+            out.append(f"[mcp] path {label}: OK   {path}")
+        else:
+            out.append(f"[mcp] path {label}: 없음 {path} "
+                       f"→ 환경변수 {var} 로 지정 (ASSEMBLY_DATA_DIR 로 data/ 통째 이동도 가능)")
+    return out
+
+
+def _report_paths_to_stderr() -> None:
+    for line in _path_diagnostics():
+        sys.stderr.write(line + "\n")
+    sys.stderr.flush()
+
+
+_report_paths_to_stderr()
 
 
 def _dir_has_entry(path: str) -> bool:
@@ -404,10 +547,11 @@ def _rag_index_missing() -> list[str]:
     """RAG 인덱스 구성요소 중 없는 것 목록. 빈 리스트면 정상."""
     missing = []
     if not any(os.path.exists(p) for p in _RAG_BM25_MANIFESTS):
-        missing.append("BM25 manifest (rag_assembly/data/bm25/manifest.json)")
+        missing.append(f"BM25 manifest ({_RAG_BM25_MANIFESTS[0]})")
     # LanceDB 테이블은 data/ 하위에 fragment 파일이 있어야 실제 데이터가 있는 것
     if not _dir_has_entry(os.path.join(_RAG_LANCE_TABLE, "data")):
-        missing.append("LanceDB chunks 데이터 (rag_assembly/data/lance_db/chunks.lance/data)")
+        missing.append("LanceDB chunks 데이터 ("
+                       + os.path.join(_RAG_LANCE_TABLE, "data") + ")")
     return missing
 
 
@@ -426,8 +570,8 @@ def _rag_unavailable_reason() -> str | None:
     pre = ("startup preimport도 실패한 상태"
            if _PREIMPORTED_API is None else "startup preimport 자체는 성공")
     return (
-        "RAG 인덱스 미구축 (rag_assembly/data에 BM25·LanceDB 인덱스 없음 — "
-        "WSL 이주 시 유실).\n"
+        f"RAG 인덱스 미구축 ({_RAG_DATA_DIR} 에 BM25·LanceDB 인덱스 없음).\n"
+        "인덱스를 다른 위치에 뒀다면 환경변수 RAG_DATA_DIR 로 지정하세요.\n"
         f"없는 구성요소: {', '.join(missing)}\n"
         f"참고: {pre}.\n"
         "DuckDB 도구(list_tables / describe_table / query / get_overview)는 "
@@ -1220,6 +1364,12 @@ def rag_stats() -> str:
 
 
 if __name__ == "__main__":
+    # 경로 점검 전용 모드 — 서버를 띄우지 않으므로 stdout에 찍어도 안전하다.
+    # (Windows 이관 시 "어느 경로를 보고 있는지"를 MCP 클라이언트 없이 확인.)
+    if "--paths" in sys.argv[1:]:
+        for _line in _path_diagnostics():
+            print(_line)
+        sys.exit(0)
     # BM25 로드·임베딩 모델 로드 모두 handshake와 분리 — mcp.run() 진입을 막지
     # 않는다. 둘 다 데몬 스레드이고 _BM25_LOCK으로 서로 직렬화된다.
     _start_bm25_loader()

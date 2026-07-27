@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "assembly-db": {
+      "command": "D:\\assembly_serving\\venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\assembly_serving\\repo\\duckdb_mcp_server.py"
+      ],
+      "env": {
+        "ASSEMBLY_DATA_DIR": "D:\\assembly_serving\\data",
+        "RAG_DATA_DIR": "D:\\assembly_serving\\rag_data",
+        "HF_HOME": "D:\\assembly_serving\\hf_cache",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

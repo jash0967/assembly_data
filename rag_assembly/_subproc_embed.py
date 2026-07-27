@@ -19,12 +19,24 @@ google-genai 의 네트워크 호출이었고, 로컬 모델에는 그 원인이
     구간 동안 fd 1을 stderr로 돌린 뒤 마지막에 복구하고 JSON만 쓴다.
     (전용 subprocess라 프로세스 전역 fd 조작이 안전하다 — MCP 서버 본체에서
      같은 짓을 하면 FastMCP 응답과 경합한다.)
+  - 표준 스트림은 UTF-8로 고정한다. 호출자(duckdb_mcp_server::
+    _embed_query_subproc)가 encoding="utf-8"로 한국어 질의를 써 보내는데,
+    Windows에서는 자식의 sys.stdin 기본 인코딩이 cp949라 그대로 두면
+    한국어 질의가 UnicodeDecodeError·문자 깨짐으로 죽는다.
 """
 import json
 import os
 import sys
 
 import _bootstrap  # noqa: F401
+
+# 로케일(Windows cp949 등)과 무관하게 UTF-8 — 호출자와의 계약.
+for _stream, _errors in ((sys.stdin, "replace"), (sys.stdout, "strict"),
+                         (sys.stderr, "replace")):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors=_errors)
+    except Exception:  # noqa: BLE001 — 리다이렉트된 스트림 등
+        pass
 
 
 def main() -> None:

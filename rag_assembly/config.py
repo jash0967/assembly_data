@@ -14,14 +14,51 @@ repo root config.py(DB 경로 등)와 별도. 양쪽 다 import 가능.
   문서 측 인덱스를 만든 embed_config(= data/embed_config.json 사이드카,
   manifest.sqlite::embed_config)와 반드시 일치해야 한다 —
   `python -m embedder --contract` 로 대조 가능.
+
+인덱스 위치 (2026-07-27):
+  `RAG_DATA_DIR` 환경변수로 DATA_DIR(= LanceDB·BM25·manifest.sqlite·
+  embed_config.json 의 부모)을 옮길 수 있다. **미설정 시 기존과 동일하게
+  rag_assembly/data.** duckdb_mcp_server.py 도 같은 변수를 같은 규칙으로 읽으므로
+  둘이 갈라지지 않는다. 전체 환경변수 목록·규칙은 duckdb_mcp_server.py
+  모듈 docstring(§경로 환경변수)이 정본이다.
 """
 import json
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
+
+
+def _resolve_data_dir() -> Path:
+    """RAG_DATA_DIR 환경변수 → DATA_DIR. 미설정·빈 값이면 ROOT/"data" (기존 동작).
+
+    설정 시 ~ 와 $VAR/%VAR% 를 확장한 뒤 절대경로로 정규화한다 (Windows 드라이브
+    문자·역슬래시 안전). 상대경로는 프로세스 CWD 기준이므로 절대경로 권장.
+    duckdb_mcp_server.py::_env_path() 와 **동일한 규칙**이어야 한다.
+    """
+    raw = (os.environ.get("RAG_DATA_DIR") or "").strip()
+    if not raw:
+        return ROOT / "data"
+    return Path(os.path.abspath(os.path.expanduser(os.path.expandvars(raw))))
+
+
+def _ensure_dir(p: Path) -> None:
+    """디렉터리 보장. 실패해도 import를 죽이지 않는다 (stderr 경고만).
+
+    기본 경로에서는 이미 존재하므로 no-op. RAG_DATA_DIR 오타로 만들 수 없는
+    경로가 들어와도 MCP 서버가 뜨긴 해야 한다(DuckDB 도구는 살아 있어야 하고,
+    경로 진단은 duckdb_mcp_server.py 가 stderr로 안내한다).
+    """
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"[rag_config] 디렉터리 생성 실패: {p} "
+                         f"({type(e).__name__}: {e}) — RAG_DATA_DIR 확인\n")
+
+
+DATA_DIR = _resolve_data_dir()
+_ensure_dir(DATA_DIR)
 
 # ── (미사용) Vertex AI 잔존 상수 ───────────────────────
 # 로컬 모델 전환으로 서빙·인덱싱 어느 경로도 더 이상 읽지 않는다.
@@ -78,7 +115,7 @@ LANCE_DIR = DATA_DIR / "lance_db"
 MANIFEST_DB = DATA_DIR / "manifest.sqlite"
 BM25_PKL = DATA_DIR / "bm25.pkl"
 RUN_DIR = DATA_DIR / "run"
-RUN_DIR.mkdir(exist_ok=True)
+_ensure_dir(RUN_DIR)
 
 # LanceDB 테이블명
 TABLE_NAME = "chunks"
