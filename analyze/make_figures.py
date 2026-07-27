@@ -12,8 +12,9 @@
 뉴스 그림 (news_descriptive 데이터 로더 경유 — news_analysis.duckdb cleaned subset):
   [fig04]      한·영·미 3소스 보도 속성 분포 (KR 뉴스 + Guardian + NYT)
   [report41a]  국내 6개 매체 10년 보도 추이 (월 stacked area + 12M MA)
-  [report41b]  AI 기본법 통과 ±24개월 윈도우 (매체별 전/후 월평균)
-  [report41c]  국내 매체별·연도별 정책 속성 구성
+  [report41b]  AI 기본법 통과 ±6개월 윈도우 (매체별 전/후 월평균)
+  [report41c]  전 매체 합산 정책 속성 구성 트리맵
+  [report41d]  연도별 정책 속성 추세
   [fig05_discourse_legislation_gap] KR22 입법 vs KR뉴스 격차
 
 산출: figures/*.png + figures/figures_data.xlsx (편집자 인계용 수치).
@@ -24,6 +25,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+from matplotlib.patches import Rectangle
 import numpy as np
 import json, os, re, sys
 from collections import Counter, defaultdict
@@ -37,7 +39,19 @@ import news_descriptive as nd
 sys.stdout.reconfigure(encoding='utf-8')
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FIG_DIR = os.path.join(ROOT, 'figures')  # 보고서가 고정 참조하는 그림 산출 디렉터리
+FIG_DIR    = os.path.join(ROOT, 'figures')       # 보고서가 고정 참조하는 그림 산출 디렉터리
+SOURCE_DIR = os.path.join(ROOT, 'output', 'figures', 'source')  # 출판사 인계용 CSV
+os.makedirs(SOURCE_DIR, exist_ok=True)
+
+import csv as _csv
+
+def write_source_csv(filename, header, rows):
+    """출판사 인계용 원자료 CSV — utf-8-sig(BOM), output/figures/source/ 저장."""
+    path = os.path.join(SOURCE_DIR, filename)
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        w = _csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
 
 # ── 그림 데이터 수치 엑셀 저장 ──
 # 편집자가 새로 표·차트를 만들 때 참조할 수 있도록 모든 그림의 입력 수치를
@@ -61,11 +75,13 @@ def add_data_sheet(name, header, rows, note=None):
     for r in rows:
         ws.append(list(r))
 
+_NANUMSQUARE_PATH = os.path.join(os.path.dirname(config.KO_FONT_PATH), 'NanumSquare.ttf')
+
 def _resolve_korean_font():
-    """한글 TTF 경로 1개 반환. config.KO_FONT_PATH(캐시) → 시스템 → WSL 마운트 순.
-    마운트본을 찾으면 캐시(KO_FONT_PATH)로 복사해 다음 실행부터 안정적으로 쓴다.
+    """한글 TTF 경로 1개 반환. NanumSquare 우선 → NanumGothic 순.
     못 찾으면 None (한글이 □로 보일 수 있음)."""
     cands = [
+        _NANUMSQUARE_PATH,           # NanumSquare (세련된 네모 계열)
         config.KO_FONT_PATH,
         '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
         '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
@@ -92,10 +108,10 @@ if font_path:
     fm.fontManager.addfont(font_path)
     plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
     fp = fm.FontProperties(fname=font_path)
-    fp13 = fm.FontProperties(fname=font_path, size=13)
+    fp18 = fm.FontProperties(fname=font_path, size=18)
 else:
     fp = fm.FontProperties()
-    fp13 = fm.FontProperties(size=13)
+    fp18 = fm.FontProperties(size=18)
 
 # EN→KR 정책 속성 라벨 (표 1 기준 단일 용어)
 EN_TO_KR = {
@@ -142,11 +158,14 @@ for b in kr_bills:
 years = sorted(yr_count.keys())
 counts = [yr_count[y] for y in years]
 
-# 2026 연간 추정 (4월 18일 기준, 108일 경과)
-# 현재까지 실제 건수에서 선형 연장
+# 2026 연간 추정 — 보고서 작성 시점(2026-04-19, 연초부터 109일 경과)으로 컷오프 고정.
+# date.today()를 쓰면 재실행할 때마다 경과일이 늘어 추정치가 달라진다(본문은 ~167건으로
+# 확정 기술). 본문과 영구히 일치시키기 위해 고정 컷오프를 사용한다.
+# 현 데이터(2026 실측 50건) 기준 forecast = round(50 * 365 / 109) = 167.
+# ⚠ 2026 법안이 추가 수집되면 cur_2026이 늘어 추정치가 167을 벗어날 수 있음.
 import datetime
-today = datetime.date.today()
-days_elapsed = (today - datetime.date(today.year, 1, 1)).days + 1
+REPORT_CUTOFF = datetime.date(2026, 4, 19)
+days_elapsed = (REPORT_CUTOFF - datetime.date(REPORT_CUTOFF.year, 1, 1)).days + 1
 cur_2026 = yr_count.get(2026, 0)
 forecast_2026 = round(cur_2026 * 365 / days_elapsed) if cur_2026 > 0 and days_elapsed > 0 else cur_2026
 
@@ -154,7 +173,6 @@ fig, ax = plt.subplots(figsize=(14, 6))
 bars = ax.bar(years, counts, color='#4472C4', width=0.7, edgecolor='white', linewidth=0.5)
 
 events = {
-    2018: ('AlphaGo\n이후\n착수기', 'red'),
     2023: ('ChatGPT\n확산', 'red'),
     2026: ('AI 기본법\n시행', 'darkgreen'),
 }
@@ -162,40 +180,39 @@ for yr, (label, color) in events.items():
     if yr in years:
         idx = years.index(yr)
         ax.annotate(label, xy=(yr, counts[idx]), xytext=(yr, counts[idx] + 15),
-                    ha='center', fontsize=11, fontproperties=fp, color=color,
+                    ha='center', fontsize=15, fontproperties=fp, color=color,
                     arrowprops=dict(arrowstyle='->', color=color, lw=1.5))
 
-# 대수 구분 음영
+# 대수 구분 음영 — 좌단을 데이터(AI 법안) 시작(2018)에 맞춤. 20대는 2018 이후만 표시.
+x_left = min(years) - 0.5
 spans = [
-    (2016.5, 2020.5, '20대'),
+    (x_left, 2020.5, '20대'),
     (2020.5, 2024.5, '21대'),
     (2024.5, 2026.5, '22대'),
 ]
 for x0, x1, label in spans:
     ax.axvspan(x0, x1, alpha=0.1, color='gray', zorder=0)
     ax.text((x0 + x1) / 2, max(counts) * 0.95, label,
-            ha='center', fontsize=13, fontproperties=fp, alpha=0.5)
+            ha='center', fontsize=18, fontproperties=fp, alpha=0.5)
 
 for bar, val in zip(bars, counts):
     if val > 0:
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                str(val), ha='center', va='bottom', fontsize=10, fontweight='bold')
+                str(val), ha='center', va='bottom', fontsize=14, fontweight='bold')
 
 # 2026 forecast 점선
 if forecast_2026 > cur_2026:
     ax.bar(2026, forecast_2026 - cur_2026, width=0.7, bottom=cur_2026,
            color='none', edgecolor='#4472C4', linewidth=2, linestyle='--', zorder=5)
     ax.text(2026, forecast_2026 + 2, f'~{forecast_2026}\n(연간 추정)',
-            ha='center', va='bottom', fontsize=10, fontproperties=fp,
+            ha='center', va='bottom', fontsize=14, fontproperties=fp,
             color='#4472C4', fontstyle='italic')
 
-ax.set_xlabel('연도', fontproperties=fp, fontsize=15)
-ax.set_ylabel('AI 관련 법안 수', fontproperties=fp, fontsize=15)
-ax.set_title(f'연도별 AI 관련 입법 추이 (KR 19~22대, 누적 {len(kr_bills)}건)',
-             fontproperties=fp, fontsize=17, fontweight='bold')
+ax.set_xlabel('연도', fontproperties=fp, fontsize=21)
+ax.set_ylabel('AI 관련 법안 수', fontproperties=fp, fontsize=21)
 ax.set_xticks(years)
-ax.tick_params(axis='both', labelsize=11)
-ax.set_xlim(min(years) - 0.6, max(years) + 0.6)
+ax.tick_params(axis='both', labelsize=15)
+ax.set_xlim(x_left, max(years) + 0.6)
 ax.set_ylim(0, max(max(counts), forecast_2026) * 1.2)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
@@ -208,7 +225,8 @@ if forecast_2026 > cur_2026:
     _rows.append((2026, forecast_2026, f'연간 추정 (실측 {cur_2026}건 → 365/{days_elapsed}일 환산)'))
 add_data_sheet('fig01_연도별_입법',
                ['연도', '법안수', '비고'], _rows,
-               note='[그림 1] 연도별 AI 관련 입법 추이 (KR 19~22대)')
+               note='[그림 1] 연도별 AI 관련 입법 추이 (KR 20~22대, 2018~)')
+write_source_csv('fig06_legislation_trend.csv', ['연도', '법안수', '비고'], _rows)
 print('  fig01 done')
 
 
@@ -243,12 +261,12 @@ bars = ax.bar(x, vals, color='#4472C4', width=0.75, edgecolor='white', linewidth
 
 for xi, v in zip(x, vals):
     if v > 0:
-        ax.text(xi, v + 0.3, str(v), ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax.text(xi, v + 0.3, str(v), ha='center', va='bottom', fontsize=13, fontweight='bold')
 
 ax2 = ax.twinx()
 ax2.plot(x, cum, 'o-', color='#d9534f', linewidth=2, markersize=5, zorder=3, label='누적')
-ax2.set_ylabel('누적 법안 수', fontproperties=fp, fontsize=12, color='#d9534f')
-ax2.tick_params(axis='y', labelsize=10, colors='#d9534f')
+ax2.set_ylabel('누적 법안 수', fontproperties=fp, fontsize=17, color='#d9534f')
+ax2.tick_params(axis='y', labelsize=14, colors='#d9534f')
 ax2.set_ylim(0, max(cum) * 1.15 if len(cum) else 10)
 
 milestones = {
@@ -260,33 +278,33 @@ for mm, (label, color) in milestones.items():
     if mm in months_seq:
         idx = months_seq.index(mm)
         ax.annotate(label, xy=(idx, vals[idx]), xytext=(idx, y_top),
-                    ha='center', fontsize=10, fontproperties=fp, color=color,
+                    ha='center', fontsize=14, fontproperties=fp, color=color,
                     arrowprops=dict(arrowstyle='->', color=color, lw=1.3))
 
 ax.set_xticks(x)
-ax.set_xticklabels([mm[2:] for mm in months_seq], rotation=45, ha='right', fontsize=9)
-ax.set_xlabel('월 (YY-MM)', fontproperties=fp, fontsize=13)
-ax.set_ylabel('월별 법안 수', fontproperties=fp, fontsize=13, color='#4472C4')
-ax.tick_params(axis='y', labelsize=10, colors='#4472C4')
+ax.set_xticklabels([mm[2:] for mm in months_seq], rotation=45, ha='right', fontsize=13)
+ax.set_xlabel('월 (YY-MM)', fontproperties=fp, fontsize=18)
+ax.set_ylabel('월별 법안 수', fontproperties=fp, fontsize=18, color='#4472C4')
+ax.tick_params(axis='y', labelsize=14, colors='#4472C4')
 ax.set_ylim(0, y_top * 1.15)
-ax.set_title(f'22대 국회 월별 AI 입법 추이 (2024.05~{months_seq[-1]}, 총 {sum(vals)}건)',
-             fontproperties=fp, fontsize=16, fontweight='bold')
 ax.spines['top'].set_visible(False)
 ax.grid(axis='y', alpha=0.25, zorder=1)
 
 # 범례 (양 축 결합)
 lines1, labels1 = ax.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
-ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=11, prop=fp)
+ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=15, prop=fp)
 
 plt.tight_layout()
 plt.savefig(os.path.join(FIG_DIR, 'fig01b_kr22_monthly_trend.png'), dpi=200, bbox_inches='tight')
 plt.close()
 
+_monthly_rows = [(m, int(v), int(c)) for m, v, c in zip(months_seq, vals, cum)]
 add_data_sheet('fig02_22대_월별',
                ['월(YYYY-MM)', '월별 발의', '누적'],
-               [(m, int(v), int(c)) for m, v, c in zip(months_seq, vals, cum)],
+               _monthly_rows,
                note='[그림 2] 22대 국회 월별 AI 입법 추이 (2024.05~)')
+write_source_csv('fig07_kr22_monthly.csv', ['월(YYYY-MM)', '월별_발의', '누적'], _monthly_rows)
 print('  fig01b done')
 
 
@@ -328,34 +346,31 @@ for i, attr in enumerate(attrs_c):
     for j, v in enumerate(row):
         if v >= 5:
             ax.text(left[j] + v/2, y[j], f'{v}',
-                    ha='center', va='center', fontsize=9,
+                    ha='center', va='center', fontsize=13,
                     fontweight='bold', color='white')
     left += row
 
 # 막대 끝에 총 N
 for j, (a, total) in enumerate(zip(ages_c, age_totals_c)):
-    ax.text(total + x_max * 0.01, y[j], f'N = {total}',
-            ha='left', va='center', fontproperties=fp, fontsize=11,
+    ax.text(total + x_max * 0.01, y[j], f'{total}',
+            ha='left', va='center', fontproperties=fp, fontsize=15,
             fontweight='bold')
 
 # 19대 "발의 없음" 표시
 if age_totals_c[0] == 0:
     ax.text(x_max * 0.05, y[0], '(19대: AI 관련 법률안 없음)',
-            ha='left', va='center', fontproperties=fp, fontsize=11,
+            ha='left', va='center', fontproperties=fp, fontsize=15,
             color='#555', fontstyle='italic')
 
 ax.set_yticks(y)
-ax.set_yticklabels(age_labels_c, fontproperties=fp, fontsize=13)
+ax.set_yticklabels(age_labels_c, fontproperties=fp, fontsize=18)
 ax.invert_yaxis()
-ax.set_xlabel('AI 관련 법률안 수 (건)', fontproperties=fp, fontsize=12)
+ax.set_xlabel('AI 관련 법률안 수 (건)', fontproperties=fp, fontsize=17)
 ax.set_xlim(0, x_max * 1.1)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
-ax.set_title('대한민국 국회 대수별 AI 법률안 정책 속성 구성',
-             fontproperties=fp, fontsize=15, fontweight='bold')
-
 ax.legend(prop=fp, loc='lower center', bbox_to_anchor=(0.5, -0.35),
-          ncol=5, frameon=False, fontsize=10)
+          ncol=5, frameon=False, fontsize=14)
 
 plt.tight_layout()
 plt.savefig(os.path.join(FIG_DIR, 'fig03_kr_composition_stacked.png'),
@@ -369,6 +384,7 @@ _rows.append(['총계 (N)'] + age_totals_c)
 add_data_sheet('fig03_대수별_속성구성',
                ['속성'] + age_labels_c, _rows,
                note='[그림 3] KR 대수별 AI 법률안 정책 속성 구성 (절대수)')
+write_source_csv('fig08_age_attr_composition.csv', ['속성'] + age_labels_c, _rows)
 print('  fig03 stacked bar done')
 
 
@@ -423,9 +439,9 @@ fig, ax = plt.subplots(figsize=(10, 7))
 im = ax.imshow(data, cmap='YlOrRd', aspect='auto')
 
 ax.set_xticks(range(len(ATTRS_HM)))
-ax.set_xticklabels(ATTRS_HM_KR, rotation=35, ha='right', fontsize=10, fontproperties=fp)
+ax.set_xticklabels(ATTRS_HM_KR, rotation=35, ha='right', fontsize=14, fontproperties=fp)
 ax.set_yticks(range(len(top_laws)))
-ax.set_yticklabels([f'{short(bl)}  ({totals[bl]})' for bl in top_laws], fontsize=10, fontproperties=fp)
+ax.set_yticklabels([f'{short(bl)}  ({totals[bl]})' for bl in top_laws], fontsize=14, fontproperties=fp)
 
 for i in range(len(top_laws)):
     for j in range(len(ATTRS_HM)):
@@ -433,12 +449,10 @@ for i in range(len(top_laws)):
         if v > 0:
             color = 'white' if v >= 6 else 'black'
             ax.text(j, i, str(v), ha='center', va='center', color=color,
-                    fontsize=10, fontweight='bold')
+                    fontsize=14, fontweight='bold')
 
-ax.set_title(f'22대 AI 법안: 개정 대상 법률 × 정책 속성 (상위 10개, N={kr22_total})',
-             fontproperties=fp, fontsize=13, fontweight='bold', pad=12)
 cbar = plt.colorbar(im, ax=ax, shrink=0.7)
-cbar.set_label('법안 수', fontsize=10, fontproperties=fp)
+cbar.set_label('법안 수', fontsize=14, fontproperties=fp)
 plt.tight_layout()
 plt.savefig(os.path.join(FIG_DIR, 'fig02b_kr22_law_attr_heatmap.png'), dpi=200, bbox_inches='tight')
 plt.close()
@@ -449,6 +463,8 @@ for i, bl in enumerate(top_laws):
 add_data_sheet('fig04_22대_법률x속성',
                ['법률(상위10)'] + ATTRS_HM_KR + ['해당 법률 총계'], _rows,
                note='[그림 4] 22대 AI 법률안 개정 대상 법률 × 정책 속성 (상위 10개)')
+write_source_csv('fig09_kr22_law_attr_heatmap.csv',
+                 ['법률(상위10)'] + ATTRS_HM_KR + ['해당_법률_총계'], _rows)
 print('  fig02b done')
 
 
@@ -488,20 +504,18 @@ bars_am = ax.barh(y - height/2, am_pct, height,
 for bar, pct in zip(bars_art, art_pct):
     if pct > 0.3:
         ax.text(bar.get_width() + 0.8, bar.get_y() + bar.get_height()/2,
-                f'{pct:.1f}%', va='center', fontsize=9)
+                f'{pct:.1f}%', va='center', fontsize=13)
 for bar, pct in zip(bars_am, am_pct):
     if pct > 0.3:
         ax.text(bar.get_width() + 0.8, bar.get_y() + bar.get_height()/2,
-                f'{pct:.1f}%', va='center', fontsize=9)
+                f'{pct:.1f}%', va='center', fontsize=13)
 
 ax.set_yticks(y)
-ax.set_yticklabels(ATTRS_EU_KR, fontproperties=fp, fontsize=12)
-ax.set_xlabel('비율 (%)', fontproperties=fp, fontsize=14)
-ax.set_title('EU AI Act 조문 vs 유럽의회 수정안 — 정책 속성 분포',
-             fontproperties=fp, fontsize=16, fontweight='bold')
-ax.legend(prop=fp13, loc='lower right')
+ax.set_yticklabels(ATTRS_EU_KR, fontproperties=fp, fontsize=17)
+ax.set_xlabel('비율 (%)', fontproperties=fp, fontsize=20)
+ax.legend(prop=fp18, loc='lower right')
 ax.invert_yaxis()
-ax.tick_params(axis='x', labelsize=11)
+ax.tick_params(axis='x', labelsize=15)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
 ax.set_xlim(0, max(max(art_pct), max(am_pct)) * 1.15)
@@ -571,9 +585,9 @@ src_labels_with_n = [f'{name}\n(N={t})' for (name, _), t in zip(src_groups, tota
 fig, ax = plt.subplots(figsize=(10, 8))
 im = ax.imshow(mat, cmap='YlOrRd', aspect='auto', vmin=0, vmax=80)
 ax.set_xticks(np.arange(len(src_groups)))
-ax.set_xticklabels(src_labels_with_n, fontproperties=fp, fontsize=11)
+ax.set_xticklabels(src_labels_with_n, fontproperties=fp, fontsize=15)
 ax.set_yticks(np.arange(len(SIX_SRC_ATTRS_KR)))
-ax.set_yticklabels(SIX_SRC_ATTRS_KR, fontproperties=fp, fontsize=12)
+ax.set_yticklabels(SIX_SRC_ATTRS_KR, fontproperties=fp, fontsize=17)
 
 for ai in range(len(SIX_SRC_ATTRS_KR)):
     for si in range(len(src_groups)):
@@ -585,13 +599,11 @@ for ai in range(len(SIX_SRC_ATTRS_KR)):
             txt = f'{v:.1f}'
             color = 'white' if v > 40 else 'black'
         ax.text(si, ai, txt, ha='center', va='center',
-                fontsize=10, color=color, fontweight='bold' if v > 15 else 'normal')
+                fontsize=14, color=color, fontweight='bold' if v > 15 else 'normal')
 
-ax.set_title('정책 속성별 비중 히트맵 (한·미·EU 6 소스)',
-             fontproperties=fp, fontsize=15, fontweight='bold')
 cbar = plt.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
-cbar.set_label('비중 (%)', fontproperties=fp, fontsize=11)
-cbar.ax.tick_params(labelsize=9)
+cbar.set_label('비중 (%)', fontproperties=fp, fontsize=15)
+cbar.ax.tick_params(labelsize=13)
 ax.set_xticks(np.arange(len(src_groups) + 1) - 0.5, minor=True)
 ax.set_yticks(np.arange(len(SIX_SRC_ATTRS_KR) + 1) - 0.5, minor=True)
 ax.grid(which='minor', color='white', linewidth=1.5)
@@ -609,6 +621,7 @@ for ai, attr in enumerate(SIX_SRC_ATTRS_KR):
 add_data_sheet('fig05_6소스_히트맵',
                _header, _rows,
                note='[그림 5] 한·미·EU 6 소스 정책 속성 비중 히트맵 (단위: %)')
+write_source_csv('fig10_6src_heatmap.csv', _header, _rows)
 print('  fig05 heatmap done')
 
 
@@ -664,14 +677,12 @@ ax.bar(x, g_pct, width, label=f'Guardian ({_g_n:,}건)',
 ax.bar(x + width, n_pct, width, label=f'NYT ({_n_n:,}건)',
        color='#A23B72', edgecolor='white')
 
-ax.set_xlabel('정책 속성', fontproperties=fp, fontsize=15)
-ax.set_ylabel('비율 (%)', fontproperties=fp, fontsize=15)
-ax.set_title('AI 관련 언론 보도의 정책 속성별 분포 (국내 cleaned subset vs 영·미 제목필터, none 제외)',
-             fontproperties=fp, fontsize=15, fontweight='bold')
+ax.set_xlabel('정책 속성', fontproperties=fp, fontsize=21)
+ax.set_ylabel('비율 (%)', fontproperties=fp, fontsize=21)
 ax.set_xticks(x)
-ax.set_xticklabels(NEWS_CATS, fontproperties=fp, fontsize=11, rotation=30, ha='right')
-ax.tick_params(axis='y', labelsize=12)
-ax.legend(prop=fp13)
+ax.set_xticklabels(NEWS_CATS, fontproperties=fp, fontsize=15, rotation=30, ha='right')
+ax.tick_params(axis='y', labelsize=17)
+ax.legend(prop=fp18)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
 ax.set_ylim(0, max(max(kr_pct), max(g_pct), max(n_pct)) * 1.2)
@@ -693,6 +704,12 @@ add_data_sheet('fig04_뉴스_3소스',
                 f'NYT 건수 (N={_n_n:,})', '비율 (%)'],
                _rows,
                note='[그림 8] 뉴스 3소스 (국내 6개 매체 / Guardian / NYT) 정책 속성 분포 (none 제외)')
+write_source_csv('fig05_news_3src_attr.csv',
+                 ['속성',
+                  f'국내_건수(N={_kr_n:,})', '국내_비율_pct',
+                  f'Guardian_건수(N={_g_n:,})', 'Guardian_비율_pct',
+                  f'NYT_건수(N={_n_n:,})', 'NYT_비율_pct'],
+                 _rows)
 print('  fig04 done')
 
 
@@ -725,16 +742,13 @@ ax.barh(_y + _h / 2, _news_vals, _h, label=f'국내 뉴스 (N={kr_news_total:,})
 for _yi, c in enumerate(_g5_order):
     _gap = _kr_leg_pct[c] - _kr_news_pct[c]
     _xm = max(_kr_leg_pct[c], _kr_news_pct[c])
-    ax.text(_xm + 0.8, _yi, f'{_gap:+.1f}%p', va='center', fontsize=9,
+    ax.text(_xm + 0.8, _yi, f'{_gap:+.1f}%p', va='center', fontsize=13,
             fontproperties=fp, color='#1f4e79' if _gap >= 0 else '#c0392b')
 ax.set_yticks(_y)
-ax.set_yticklabels(_g5_order, fontproperties=fp, fontsize=12)
+ax.set_yticklabels(_g5_order, fontproperties=fp, fontsize=17)
 ax.invert_yaxis()
-ax.set_xlabel('비중 (%, 미분류 제외)', fontproperties=fp, fontsize=13)
-ax.set_title('국내 AI 입법(22대) vs 공론(국내 뉴스) 정책 속성 비교\n'
-             '(우측 %p = 입법 - 공론, 양수=입법 추월)',
-             fontproperties=fp, fontsize=14, fontweight='bold')
-ax.legend(prop=fp13, loc='lower right')
+ax.set_xlabel('비중 (%, 미분류 제외)', fontproperties=fp, fontsize=18)
+ax.legend(prop=fp18, loc='lower right')
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
 ax.set_xlim(0, max(max(_leg_vals), max(_news_vals)) * 1.18)
@@ -750,6 +764,10 @@ add_data_sheet('fig05_KR입법vs공론',
                 f'국내 뉴스 % (N={kr_news_total:,})', '격차 %p(입법-공론)'],
                _rows,
                note='[그림 8/§4.4] KR22 입법 vs 국내 뉴스 정책 속성 격차 (입법-공론)')
+write_source_csv('fig11_discourse_legislation_gap.csv',
+                 ['속성', f'22대_입법_pct(N={kr_leg_total})',
+                  f'국내뉴스_pct(N={kr_news_total:,})', '격차_ppt(입법-공론)'],
+                 _rows)
 print('  fig05 done')
 
 # ════════════════════════════════════════
@@ -809,10 +827,10 @@ im = ax.imshow(mat, cmap='RdBu_r', vmin=-VCLIP, vmax=VCLIP, aspect='auto')
 ax.set_xticks(range(len(regions)))
 ax.set_xticklabels([f'{r}\n{ln_name} N={ln:,}\n{nn_name} N={nn:,}'
                     for r, ln_name, nn_name, _, ln, nn in regions],
-                   fontproperties=fp, fontsize=11)
+                   fontproperties=fp, fontsize=15)
 # y축 라벨
 ax.set_yticks(range(len(order)))
-ax.set_yticklabels(order, fontproperties=fp, fontsize=12)
+ax.set_yticklabels(order, fontproperties=fp, fontsize=17)
 
 # 셀 값 텍스트
 for i, c in enumerate(order):
@@ -821,13 +839,13 @@ for i, c in enumerate(order):
         text_color = 'white' if abs(v) > VCLIP * 0.55 else 'black'
         weight = 'bold' if abs(v) >= 5 else 'normal'
         ax.text(j, i, f'{v:+.1f}', ha='center', va='center',
-                color=text_color, fontsize=12, fontweight=weight,
+                color=text_color, fontsize=17, fontweight=weight,
                 fontproperties=fp)
 
 # 색상바
 cbar = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.03, extend='both')
-cbar.set_label('격차 (입법% - 뉴스%) %p', fontproperties=fp, fontsize=11)
-cbar.ax.tick_params(labelsize=10)
+cbar.set_label('격차 (입법% - 뉴스%) %p', fontproperties=fp, fontsize=15)
+cbar.ax.tick_params(labelsize=14)
 
 # 셀 사이 흰선
 ax.set_xticks(np.arange(-0.5, len(regions), 1), minor=True)
@@ -835,13 +853,10 @@ ax.set_yticks(np.arange(-0.5, len(order), 1), minor=True)
 ax.grid(which='minor', color='white', linewidth=2)
 ax.tick_params(which='minor', length=0)
 
-ax.set_title('한·미·EU 입법-공론 격차 비교\n빨강: 입법이 공론을 추월     파랑: 공론이 입법을 추월',
-             fontproperties=fp, fontsize=13, fontweight='bold', pad=12)
-
 # outlier 주석 (EU 안전성 +69.7)
 fig.text(0.5, -0.02,
          '* 색상 척도는 ±20%p에서 클립 (EU 안전성 실값 +69.7%p, 한국·미국 안보 등 모든 외부값은 텍스트로 표기)',
-         ha='center', fontproperties=fp, fontsize=9, color='gray')
+         ha='center', fontproperties=fp, fontsize=13, color='gray')
 
 plt.tight_layout()
 plt.savefig(os.path.join(FIG_DIR, 'fig06_gap_3region.png'),
@@ -865,6 +880,12 @@ add_data_sheet('fig09_3국격차',
                 f'EU Act % (N={eu_act_total})', '가디언 뉴스 %', '격차 EU %p'],
                _rows,
                note='[그림 9] 한·미·EU 입법-공론 격차 비교 (KR22-국내뉴스, US119-NYT, EU Act-Guardian)')
+write_source_csv('fig12_3region_gap.csv',
+                 ['속성',
+                  f'KR22_입법_pct(N={kr22_total_c})', 'KR_뉴스_pct', 'KR_격차_ppt',
+                  f'US119_입법_pct(N={us119_total})', 'US_NYT_pct', 'US_격차_ppt',
+                  f'EUAct_pct(N={eu_act_total})', 'EU_가디언_pct', 'EU_격차_ppt'],
+                 _rows)
 print('  fig06 done')
 
 
@@ -894,29 +915,27 @@ _all_ym = sorted({ym for v in _monthly.values() for ym, _ in v})
 _dates = [_dt.strptime(ym, '%Y-%m') for ym in _all_ym]
 _N_TOTAL = nd.load_classification_coverage()['total_articles']
 
-# ── report41a: 10년 보도 추이 (매체 stacked area + 12M 이동평균 + 마커) ──
+# ── report41a: 10년 보도 추이 (전체 합산 라인 + 12M 이동평균 + 마커) ──
 print('  report41a decade trend...', flush=True)
 _areas = np.array([[dict(_monthly[p]).get(ym, 0) for ym in _all_ym] for p in NEWS_PROVS])
 _total_y = _areas.sum(axis=0).astype(float)
 
 fig, ax = plt.subplots(figsize=(13, 6))
-ax.stackplot(_dates, _areas, labels=NEWS_PROVS, colors=PROV_COLORS,
-             alpha=0.78, edgecolor='white', linewidth=0.3)
+ax.plot(_dates, _total_y, color='#4472C4', linewidth=1.6, alpha=0.5, label='월별 보도량')
+ax.fill_between(_dates, _total_y, alpha=0.12, color='#4472C4')
 _win = 12
 if len(_total_y) >= _win:
     _ma = np.convolve(_total_y, np.ones(_win) / _win, mode='valid')
-    ax.plot(_dates[_win - 1:], _ma, color='black', linewidth=1.8,
-            label='12개월 이동평균', alpha=0.85)
+    ax.plot(_dates[_win - 1:], _ma, color='black', linewidth=2.2,
+            label='12개월 이동평균', alpha=0.9)
 _ymax = (max(_total_y) * 1.18) if len(_total_y) else 1
 for d, lbl in _NEWS_MARKERS:
     ax.axvline(d, color='red', linestyle='--', linewidth=1.0, alpha=0.65)
-    ax.text(d, _ymax * 0.97, '  ' + lbl, fontproperties=fp, fontsize=9,
+    ax.text(d, _ymax * 0.97, '  ' + lbl, fontproperties=fp, fontsize=13,
             color='red', alpha=0.92, rotation=90, ha='left', va='top')
-ax.set_xlabel('연·월', fontproperties=fp, fontsize=12)
-ax.set_ylabel('월별 AI 보도량', fontproperties=fp, fontsize=12)
-ax.set_title(f'국내 6개 언론사 AI 보도 추이 ({_all_ym[0]}~{_all_ym[-1]}, n={_N_TOTAL:,})',
-             fontproperties=fp, fontsize=14, fontweight='bold')
-ax.legend(prop=fp, loc='upper left', ncol=4, fontsize=10)
+ax.set_xlabel('연·월', fontproperties=fp, fontsize=17)
+ax.set_ylabel('월별 AI 보도량', fontproperties=fp, fontsize=17)
+ax.legend(prop=fp, loc='upper left', fontsize=14)
 ax.set_ylim(0, _ymax)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
@@ -929,67 +948,73 @@ _rows = [[ym, int(_total_y[j])] + [int(_areas[i, j]) for i in range(len(NEWS_PRO
 add_data_sheet('report41a_10년추이', ['연월', '월합계'] + NEWS_PROVS, _rows,
                note=f'[그림 5] 국내 6개 매체 월별 AI 보도 (n={_N_TOTAL:,}, {_all_ym[0]}~{_all_ym[-1]})')
 
-# ── report41b: AI 기본법 통과 ±24개월 (좌 zoom 라인 + 우 전/후 월평균) ──
+# ── report41b: AI 기본법 전후 (좌: ±24M 맥락 합산 라인 + 우: ±6M 전/후 전체 월평균) ──
 print('  report41b AI-law window...', flush=True)
-_winw = nd.load_event_window(nd.AIBASIC_DATE, 24)
+_winw = nd.load_event_window(nd.AIBASIC_DATE, 6)
 _LAW = _dt.strptime(nd.AIBASIC_DATE, '%Y-%m-%d')
 _ev_ym = nd.AIBASIC_DATE[:7]
 _lo_ym, _hi_ym = _ym_add(_ev_ym, -24), _ym_add(_ev_ym, 24)
 _w_ym = [ym for ym in _all_ym if _lo_ym <= ym < _hi_ym]
 _w_dates = [_dt.strptime(ym, '%Y-%m') for ym in _w_ym]
 _w_series = {p: [dict(_monthly[p]).get(ym, 0) for ym in _w_ym] for p in NEWS_PROVS}
+_w_total = [sum(_w_series[p][j] for p in NEWS_PROVS) for j in range(len(_w_dates))]
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6),
-                               gridspec_kw={'width_ratios': [2.0, 1.0]})
-for i, p in enumerate(NEWS_PROVS):
-    ax1.plot(_w_dates, _w_series[p], color=PROV_COLORS[i], label=p,
-             linewidth=1.6, alpha=0.92)
-_w_total = [sum(_w_series[p][j] for p in NEWS_PROVS) for j in range(len(_w_dates))]
-ax1.fill_between(_w_dates, _w_total, alpha=0.08, color='gray', label='월별 합계')
+                               gridspec_kw={'width_ratios': [2.5, 1.0]})
+
+# 좌 패널: 전체 합산 라인 + fill
+ax1.plot(_w_dates, _w_total, color='#4472C4', linewidth=2.0, alpha=0.7, label='월별 합계')
+ax1.fill_between(_w_dates, _w_total, alpha=0.15, color='#4472C4')
+
+# ±6개월 음영
+_pre6_start = _dt.strptime(_ym_add(_ev_ym, -6), '%Y-%m')
+_post6_end   = _dt.strptime(_ym_add(_ev_ym,  7), '%Y-%m')  # +6개월의 말일 근사
+ax1.axvspan(_pre6_start, _LAW,      alpha=0.10, color='#7F7F7F', zorder=0, label='통과 전 6개월')
+ax1.axvspan(_LAW,        _post6_end, alpha=0.10, color='#1565C0', zorder=0, label='통과 후 6개월')
+
 ax1.axvline(_LAW, color='red', linestyle='--', linewidth=1.4, alpha=0.85)
 _y1 = (max(_w_total) * 1.05) if _w_total else 1
 ax1.text(_LAW, _y1, '  AI 기본법 통과\n  (2024.12.26)', fontproperties=fp,
-         fontsize=10, color='red', va='top', ha='left')
+         fontsize=14, color='red', va='top', ha='left')
 ax1.axvline(_dt(2026, 1, 22), color='green', linestyle=':', linewidth=1.2, alpha=0.7)
 ax1.text(_dt(2026, 1, 22), _y1 * 0.85, '  시행\n  (2026.01)', fontproperties=fp,
-         fontsize=9, color='green', va='top', ha='left')
-ax1.set_xlabel('연·월', fontproperties=fp, fontsize=12)
-ax1.set_ylabel('월별 AI 보도량 (매체별)', fontproperties=fp, fontsize=12)
-ax1.set_title('AI 기본법 통과 전후 ±24개월 보도 추이', fontproperties=fp,
-              fontsize=13, fontweight='bold')
-ax1.legend(prop=fp, loc='upper left', ncol=4, fontsize=9)
+         fontsize=13, color='green', va='top', ha='left')
+ax1.set_xlabel('연·월', fontproperties=fp, fontsize=17)
+ax1.set_ylabel('월별 AI 보도량 (6개 매체 합산)', fontproperties=fp, fontsize=17)
+ax1.legend(prop=fp, loc='upper left', fontsize=14, ncol=2)
 ax1.spines['top'].set_visible(False)
 ax1.spines['right'].set_visible(False)
 ax1.set_ylim(0, _y1 * 1.05)
 
-_x = np.arange(len(NEWS_PROVS))
-_wb = 0.38
-_pre = [_winw['providers'][p]['before_avg'] for p in NEWS_PROVS]
-_post = [_winw['providers'][p]['after_avg'] for p in NEWS_PROVS]
-ax2.bar(_x - _wb / 2, _pre, _wb, label='통과 전 24개월', color='#7F7F7F', edgecolor='white')
-ax2.bar(_x + _wb / 2, _post, _wb, label='통과 후 24개월', color='#1565C0', edgecolor='white')
-for i, p in enumerate(NEWS_PROVS):
-    _chg = _winw['providers'][p]['pct']
-    ax2.text(i, max(_pre[i], _post[i]) + max(_pre + _post) * 0.03, f'{_chg:+.0f}%',
-             ha='center', fontsize=9, fontproperties=fp,
-             color='darkgreen' if _chg > 0 else 'darkred', fontweight='bold')
-ax2.set_xticks(_x)
-ax2.set_xticklabels(NEWS_PROVS, fontproperties=fp, fontsize=10, rotation=20)
-ax2.set_ylabel('월평균 보도량', fontproperties=fp, fontsize=12)
-_sub = ' (부분 윈도우)' if _winw['partial'] else ''
-ax2.set_title('통과 전후 24개월 월평균 변화' + _sub, fontproperties=fp,
-              fontsize=13, fontweight='bold')
-ax2.legend(prop=fp, fontsize=10, loc='upper right')
+# 우 패널: 전체 전/후 단일 쌍 막대
+_ov = _winw['overall']
+_pre_all = _ov['before_avg']
+_post_all = _ov['after_avg']
+_wb = 0.45
+ax2.bar([0], [_pre_all], _wb, label='통과 전 6개월', color='#7F7F7F', edgecolor='white')
+ax2.bar([1], [_post_all], _wb, label='통과 후 6개월', color='#1565C0', edgecolor='white')
+_chg_all = _ov['pct']
+ax2.text(0, _pre_all + max(_pre_all, _post_all) * 0.04, f'{_pre_all:,.0f}건',
+         ha='center', fontsize=15, fontproperties=fp, fontweight='bold')
+ax2.text(1, _post_all + max(_pre_all, _post_all) * 0.04,
+         f'{_post_all:,.0f}건\n({_chg_all:+.1f}%)',
+         ha='center', fontsize=15, fontproperties=fp, fontweight='bold',
+         color='#1565C0')
+ax2.set_xticks([0, 1])
+ax2.set_xticklabels(['통과 전\n6개월', '통과 후\n6개월'], fontproperties=fp, fontsize=15)
+ax2.set_ylabel('월평균 보도량 (6개 매체 합산)', fontproperties=fp, fontsize=15)
+ax2.legend(prop=fp, fontsize=14, loc='upper left')
 ax2.spines['top'].set_visible(False)
 ax2.spines['right'].set_visible(False)
-ax2.set_ylim(0, max(_pre + _post) * 1.22)
+ax2.set_ylim(0, max(_pre_all, _post_all) * 1.30)
+ax2.set_xlim(-0.6, 1.6)
 plt.tight_layout()
 plt.savefig(os.path.join(FIG_DIR, 'report41b_aibasic_window.png'), dpi=200, bbox_inches='tight')
 plt.close()
 
 _rows = [[ym] + [_w_series[p][j] for p in NEWS_PROVS] for j, ym in enumerate(_w_ym)]
 add_data_sheet('report41b_window월별', ['연월'] + NEWS_PROVS, _rows,
-               note='[그림 6] AI 기본법 ±24개월 월별 매체 보도량')
+               note='[그림 6] AI 기본법 ±6개월 월별 매체 보도량')
 _ov = _winw['overall']
 _rows2 = [[p, round(_winw['providers'][p]['before_avg'], 1),
            round(_winw['providers'][p]['after_avg'], 1),
@@ -998,65 +1023,90 @@ _rows2.append(['전체', round(_ov['before_avg'], 1), round(_ov['after_avg'], 1)
                f"{_ov['pct']:+.1f}%"])
 add_data_sheet('report41b_전후평균', ['매체', '통과 전 월평균', '통과 후 월평균', '변화율'],
                _rows2,
-               note=f"[그림 6] AI 기본법 통과 전·후 24개월 월평균{' (부분 윈도우)' if _winw['partial'] else ''}")
+               note=f"[그림 6] AI 기본법 통과 전·후 6개월 월평균{' (부분 윈도우)' if _winw['partial'] else ''}")
 
-# ── report41c: 매체별 + 연도별 정책 속성 구성 (듀얼패널, none 제외 share) ──
-print('  report41c attributes...', flush=True)
-_p_provs, _p_attrs, _p_mat = nd.load_attr_by_provider()
-_y_years, _y_attrs, _y_share, _y_counts = nd.load_attr_by_year()
-_pmat = np.array(_p_mat)
-_attrs_no_none = [a for a in _p_attrs if a != 'none']
+# ── report41c: 전 매체 합산 정책 속성 구성 트리맵 (none 제외, 면적=기사수) ──
+print('  report41c attr treemap...', flush=True)
 _cmap = plt.get_cmap('tab10')
+_dist = [(a, c, s) for a, c, s in nd.load_attr_distribution() if a != 'none']
+_dist.sort(key=lambda t: -t[1])
 
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(16, 6.5),
-                               gridspec_kw={'width_ratios': [1.0, 1.25]})
-_left = np.zeros(len(_p_provs))
-for k, a in enumerate(_attrs_no_none):
-    ai = _p_attrs.index(a)
-    vals = np.array([
-        (_pmat[pi][ai] / max(1, sum(_pmat[pi][aj] for aj, aa in enumerate(_p_attrs) if aa != 'none')) * 100)
-        for pi in range(len(_p_provs))])
-    axL.barh(range(len(_p_provs)), vals, left=_left, color=_cmap(k % 10),
-             label=kr_label(a), edgecolor='white', height=0.7)
-    _left += vals
-axL.set_yticks(range(len(_p_provs)))
-axL.set_yticklabels(_p_provs, fontproperties=fp, fontsize=11)
-axL.invert_yaxis()
-axL.set_xlim(0, 100)
-axL.set_xlabel('속성 비중 (%, 미분류 제외)', fontproperties=fp, fontsize=12)
-axL.set_title('매체별 정책 속성 구성', fontproperties=fp, fontsize=13, fontweight='bold')
-axL.legend(prop=fp, ncol=2, fontsize=8, loc='lower right')
 
-_ymat = np.array(_y_share)
-for k, a in enumerate(_y_attrs):
-    axR.plot(_y_years, _ymat[:, k], marker='o', ms=3, color=_cmap(k % 10), label=kr_label(a))
-axR.set_xlabel('연도', fontproperties=fp, fontsize=12)
-axR.set_ylabel('속성 비중 (%, 미분류 제외)', fontproperties=fp, fontsize=12)
-axR.set_title('연도별 정책 속성 추세', fontproperties=fp, fontsize=13, fontweight='bold')
-axR.set_xticks(_y_years)
-axR.legend(prop=fp, ncol=2, fontsize=8)
-axR.spines['top'].set_visible(False)
-axR.spines['right'].set_visible(False)
-plt.tight_layout()
-plt.savefig(os.path.join(FIG_DIR, 'report41c_kr_attributes.png'), dpi=200, bbox_inches='tight')
+def _squarify(sizes, x, y, dx, dy):
+    """Bruls squarified treemap — sizes desc 가정, 입력 순서대로 rect 반환."""
+    tot = sum(sizes); sizes = [s * dx * dy / tot for s in sizes]; rects = []
+
+    def worst(row, side):
+        s = sum(row)
+        return max(side * side * max(row) / (s * s), s * s / (side * side * min(row)))
+
+    def layout(row, x, y, dx, dy):
+        s = sum(row)
+        if dx >= dy:
+            w = s / dy; yy = y
+            for r in row:
+                h = r / w; rects.append((x, yy, w, h)); yy += h
+            return x + w, y, dx - w, dy
+        h = s / dx; xx = x
+        for r in row:
+            w = r / h; rects.append((xx, y, w, h)); xx += w
+        return x, y + h, dx, dy - h
+
+    row = []
+    for s in sizes:
+        side = min(dx, dy)
+        if row and worst(row + [s], side) > worst(row, side):
+            x, y, dx, dy = layout(row, x, y, dx, dy); row = []
+        row.append(s)
+    if row:
+        layout(row, x, y, dx, dy)
+    return rects
+
+
+_W, _H = 100.0, 62.0
+_rects = _squarify([c for _, c, _ in _dist], 0, 0, _W, _H)
+plt.close('all')   # 이전 figure 상태 누수 방지 (트리맵 라벨 유령 방지)
+fig, ax = plt.subplots(figsize=(14, 8.7))
+for i, ((rx, ry, rw, rh), (a, c, s)) in enumerate(zip(_rects, _dist)):
+    ax.add_patch(Rectangle((rx, ry), rw, rh, facecolor=_cmap(i % 10),
+                           edgecolor='white', linewidth=1.5, alpha=0.92))
+    if rw > 4 and rh > 3:
+        ax.text(rx + rw / 2, ry + rh / 2, f"{kr_label(a)}\n{c:,} ({s:.0f}%)",
+                ha='center', va='center', fontproperties=fp,
+                fontsize=min(22, 11 + rw / 5), color='white', fontweight='bold',
+                linespacing=1.2, clip_on=True)
+ax.set_xlim(0, _W); ax.set_ylim(0, _H); ax.axis('off')
+# ⚠ bbox_inches='tight' 도 subplots_adjust(축을 가장자리까지 채움)도 금지:
+#   고dpi에서 가장자리 작은 타일의 넘치는 라벨이 도형 밖으로 나가면 좌측에 복제
+#   렌더되는 matplotlib 버그성 동작 발생. 기본 여백을 둬 넘침이 여백 안에 머물게 한다.
+plt.savefig(os.path.join(FIG_DIR, 'report41c_kr_attr_treemap.png'), dpi=200)
 plt.close()
-
-_rows = []
-for pi, prov in enumerate(_p_provs):
-    denom = sum(_pmat[pi][aj] for aj, aa in enumerate(_p_attrs) if aa != 'none')
-    for ai, a in enumerate(_p_attrs):
-        share = (_pmat[pi][ai] / denom * 100) if (denom and a != 'none') else ''
-        _rows.append([prov, kr_label(a), int(_pmat[pi][ai]),
-                      round(share, 2) if share != '' else ''])
-add_data_sheet('report41c_매체별속성', ['매체', '속성', '건수', '비중%(none제외)'], _rows,
-               note='[그림 7] 매체별 정책 속성 구성 (none 제외 share)')
-_rows = []
-for yi, y in enumerate(_y_years):
-    for k, a in enumerate(_y_attrs):
-        _rows.append([y, kr_label(a), int(_y_counts[yi][k]), round(_y_share[yi][k], 2)])
-add_data_sheet('report41c_연도별속성', ['연도', '속성', '건수', '비중%(none제외)'], _rows,
-               note='[그림 7] 연도별 정책 속성 추세 (none 제외 share)')
+add_data_sheet('report41c_속성구성', ['속성', '건수', '비중%(none제외)'],
+               [[kr_label(a), int(c), round(s, 2)] for a, c, s in _dist],
+               note='[그림 7] 전 매체 합산 정책 속성 구성 (트리맵, none 제외 share)')
 print('  report41c done')
+
+# ── report41d: 연도별 정책 속성 추세 (별도 figure, none 제외 share) ──
+print('  report41d attr year trend...', flush=True)
+_y_years, _y_attrs, _y_share, _y_counts = nd.load_attr_by_year()
+_ymat = np.array(_y_share)
+fig, ax = plt.subplots(figsize=(13, 7))
+for k, a in enumerate(_y_attrs):
+    ax.plot(_y_years, _ymat[:, k], marker='o', ms=4, linewidth=1.8,
+            color=_cmap(k % 10), label=kr_label(a))
+ax.set_xlabel('연도', fontproperties=fp, fontsize=18)
+ax.set_ylabel('속성 비중 (%, 미분류 제외)', fontproperties=fp, fontsize=18)
+ax.set_xticks(_y_years)
+ax.legend(prop=fp, ncol=2, fontsize=13, loc='upper right')
+ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig(os.path.join(FIG_DIR, 'report41d_kr_attr_year.png'), dpi=200, bbox_inches='tight')
+plt.close()
+add_data_sheet('report41d_연도별속성', ['연도', '속성', '건수', '비중%(none제외)'],
+               [[y, kr_label(a), int(_y_counts[yi][k]), round(_y_share[yi][k], 2)]
+                for yi, y in enumerate(_y_years) for k, a in enumerate(_y_attrs)],
+               note='[그림 8] 연도별 정책 속성 추세 (none 제외 share)')
+print('  report41d done')
 
 # ════════════════════════════════════════
 # 모든 그림 데이터를 단일 엑셀 워크북으로 저장
