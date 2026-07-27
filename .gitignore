@@ -42,3 +42,8 @@ working/
 
 # Downloaded raw documents (PDF/HWP/HWPX)
 data/docs/
+
+# 임베딩 벡터·청크 (재생성 가능, 수 GB~수십 GB)
+*.parquet
+embed_arctic_ko_*/
+rag_assembly/data/
