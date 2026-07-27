@@ -88,14 +88,14 @@ Two distinct news layers since 2026-05-21:
 
 1. **Foreign (Guardian / NYT)** — JSON on disk under `data/news/*.json`, classified with the unified 10-attribute prompt via `classify_articles.py` → `data/analysis/articles_classified_{guardian,nyt}.json`. Title filter (must contain `\bAI\b | artificial intelligence | A\.I\.`) is enforced in `classify_articles.py::title_has_kw` so cross-source comparison stays apples-to-apples.
 
-2. **Domestic Korean (KBS, MBC, SBS, YTN, 중앙일보, 한겨레)** — 157,886 articles (2018~2026) raw가 `data/news/news.duckdb`에, 2단계 정화·필터 후 81,121 articles + 분류 결과가 `data/news/news_analysis.duckdb`에 거주 (2026-05-28 분리). Source JSONs archived under `data/news/raw_news_archive/` (gitignored). The earlier Naver Search API pipeline was retired with this dataset.
+2. **Domestic Korean (KBS, MBC, SBS, YTN, 중앙일보, 한겨레)** — 157,886 articles (2018~2026) raw가 `data/news/news.duckdb`에, 2단계 정화·필터 후 76,645 articles + 분류 결과가 `data/news/news_analysis.duckdb`에 거주 (2026-05-28 분리). Source JSONs archived under `data/news/raw_news_archive/` (gitignored). The earlier Naver Search API pipeline was retired with this dataset.
 
 ### 한국 도메스틱 뉴스 정화 파이프라인 — 2단계 (since 2026-05-28)
 
 raw `news.duckdb` → `news_analysis.duckdb` 빌드 시 두 단계가 한 SQL 안에서 합성:
 
 - **Stage 1 (Boilerplate Removal)** — 본문 정화 (행 보존). Rule B1 (YTN footer 라인 제거), Rule B2 (MBC `(AI학습 포함)` substring 제거)
-- **Stage 2 (AI Relevance Filter)** — 행 단위 통과/탈락. Rule R1 (AI 키워드 매칭, sanitized content + raw title), R2 (영문 본문 제외), R3 (조류인플루엔자 약자 충돌), R4 (사이버대학 광고), R5 (일반대 모집 광고 footer 3중 조합). 결과 81,121건.
+- **Stage 2 (AI Relevance Filter)** — 행 단위 통과/탈락. Rule R1 (AI 키워드 매칭, sanitized content + raw title), R2 (영문 본문 제외), R3 (조류인플루엔자 약자 충돌), R4 (사이버대학 광고), R5 (일반대 모집 광고 footer 3중 조합). 결과 76,645건 (2026-05-30 재빌드 기준. 2026-05-28 최초 빌드는 81,121건이었고 룰 조정으로 감소 — 이력은 `news_cleaning_runs` 참조).
 
 분류 결과는 `news_analysis.duckdb::news_classifications` (PK `news_id × prompt_version`, 추가 컬럼 `cleaning_version` — 어느 룰 위에서 만들어진 분류인지 추적).
 
@@ -121,7 +121,7 @@ The data lives in **two DuckDB files** under `data/bills_kr/`:
 Domestic Korean news is **also split** since 2026-05-28:
 
 - `data/news/news.duckdb` — raw 157,886 articles in `news_articles`. Written by `collect/build_news_db.py` only.
-- `data/news/news_analysis.duckdb` — Stage 1·2 적용본 + 분류 + 빌드 메타. Tables: `news_articles` (81,121, content는 Stage 1 적용본), `news_classifications` (+ `cleaning_version` 컬럼), `news_prompt_versions`, `news_cleaning_runs`. Written by `analyze/news_cleaning.py` and `analyze/classify_news_kr*.py`.
+- `data/news/news_analysis.duckdb` — Stage 1·2 적용본 + 분류 + 빌드 메타. Tables: `news_articles` (76,645, content는 Stage 1 적용본), `news_classifications` (+ `cleaning_version` 컬럼), `news_prompt_versions`, `news_cleaning_runs`. Written by `analyze/news_cleaning.py` and `analyze/classify_news_kr*.py`.
 
 The MCP server at [duckdb_mcp_server.py](duckdb_mcp_server.py) opens `assembly_analysis.duckdb` as the main DB and ATTACHes **3 more DBs read-only**: `raw` (assembly_raw.duckdb), `news_analysis` (news_analysis.duckdb), `news_raw` (news.duckdb). From the user's side: assembly_analysis tables/views are unqualified, others are referenced with explicit prefix — `raw.v_bill`, `news_analysis.news_articles`, `news_raw.news_articles`. Assembly raw tables use cryptic API codes (e.g. `raw.nwvrqwxyaytdsfvhu`) — [CODEBOOK.md](CODEBOOK.md) maps all 37 tables to human-readable descriptions. Prefer the `v_*` views for analysis.
 

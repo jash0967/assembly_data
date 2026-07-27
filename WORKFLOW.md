@@ -135,7 +135,7 @@ Carvão Appendix II 기준 정본:
 #### 한국 도메스틱 6개 매체 — `data/news/news.duckdb` (raw) + `news_analysis.duckdb` (정화)
 - **소스**: 외부 라이선스로 입수한 정식 아카이브 — KBS, MBC, SBS, YTN, 중앙일보, 한겨레
 - **기간**: 2018-01 ~ 2026-05
-- **규모**: raw 157,886건 → 2단계 정화 후 81,121건
+- **규모**: raw 157,886건 → 2단계 정화 후 76,645건 (2026-05-30 재빌드 기준)
 - **원본 JSON**: `data/news/raw_news_archive/{매체}/{년}/{월}/{일}/*.json` (gitignored, 약 665 MB)
 - **DB 적재**:
   - 1단계: [collect/build_news_db.py](collect/build_news_db.py) → `news.duckdb::news_articles` (raw, PK = `news_id`)
@@ -212,7 +212,7 @@ Carvão Appendix II 기준 정본:
 - 출력: `data/analysis/articles_classified_{guardian,nyt}.json`
 
 #### 한국 도메스틱
-- 입력: `news_analysis.duckdb::news_articles` (Stage 1+2 적용본, 81,121건). 제목 + 본문(이미 Stage 1 정화본, cap 30,000자)
+- 입력: `news_analysis.duckdb::news_articles` (Stage 1+2 적용본, 76,645건). 제목 + 본문(이미 Stage 1 정화본, cap 30,000자)
 - 출력: `news_analysis.duckdb::news_classifications` (PK `news_id × prompt_version`, 추가 컬럼 `cleaning_version`)
 - 스크립트:
   - [analyze/classify_news_kr.py](analyze/classify_news_kr.py) — sync (smoke test·소량용)
@@ -332,7 +332,7 @@ python collect/collect_nyt.py                               # NYT Archive API
 python collect/build_news_db.py                             # 한국 6매체 archive → raw data/news/news.duckdb
 
 # 5.5. 한국 도메스틱 뉴스 cleaning (raw → news_analysis.duckdb, Stage 1+2 적용)
-python analyze/news_cleaning.py                             # 첫 빌드: 81,121건 + 기존 81k 분류 마이그레이션
+python analyze/news_cleaning.py                             # 재빌드: 현재 76,645건 (첫 빌드 81,121 → 룰 조정 후 감소)
 
 # 6. 분류
 python analyze/classify_articles.py all                     # Guardian + NYT
@@ -401,7 +401,7 @@ config 상수 (`config.py`):
 - [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + **`subtopic_assignments`** (BERTopic article→topic 매핑, run_timestamp별) + 분석 뷰
 - [ ] `data/bills_us/congress.duckdb` — US 118·119 Congress API 수집물
 - [ ] `data/news/news.duckdb` — raw `news_articles` (157,886)
-- [ ] `data/news/news_analysis.duckdb` — `news_articles` (Stage 1+2 적용본, 81,121) + **`news_classifications`** (+ `cleaning_version` 컬럼) + `news_prompt_versions` + **`news_cleaning_runs`** (빌드 메타 누적)
+- [ ] `data/news/news_analysis.duckdb` — `news_articles` (Stage 1+2 적용본, 76,645) + **`news_classifications`** (+ `cleaning_version` 컬럼) + `news_prompt_versions` + **`news_cleaning_runs`** (빌드 메타 누적)
 
 ### 원본 수집 (JSON, 일부는 DB로 흡수됨)
 - [ ] `data/news/guardian_articles_raw.json`
