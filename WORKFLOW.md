@@ -14,7 +14,7 @@
 >    - 임베딩 캐시 `data/analysis/bertopic_embeddings/*.npy` — 재실행 시 hit
 >    - article→topic 매핑 → `assembly_analysis.duckdb::subtopic_assignments` 테이블 INSERT (run_timestamp로 버전 구분)
 >    - lazy OpenAI client (`OPENAI_API_KEY` 없어도 `--no-label`로 실행 가능)
-> 3. **신규 시각화**: [figures/temporal_top10.py](figures/temporal_top10.py) — 분기별 소주제 Top-10 랭킹 변동 (Plotly bump chart) + Lifespan Gantt (matplotlib)
+> 3. **신규 시각화**: 분기별 소주제 Top-10 랭킹 변동(bump chart) + Lifespan Gantt — 구현 `figures/temporal_top10.py`는 2026-07-27 삭제(미유지). 필요 시 `git log --all -- figures/temporal_top10.py`
 >
 > **2026-05-28 — 뉴스 DB 분리 + 2단계 cleaning 파이프라인 + cleaning_version 메타**
 >
@@ -263,11 +263,9 @@ Carvão Appendix II 기준 정본:
 | 스크립트 | 역할 |
 |----------|------|
 | [analyze/make_figures.py](analyze/make_figures.py) | **현행 정본** 그림 일괄 생성 (fig01~fig06 + report41a/b/c + figures_data.xlsx). 구 `figures/regenerate_all.py`. 법안 그림은 `bill_loaders`, 뉴스 그림(report41*·fig04·fig05)은 `news_descriptive` 데이터 로더 경유. `news_descriptive.py`로 데이터를 갱신한 뒤 그림이 필요하면 이 스크립트를 재실행 |
-| `figures/_legacy/generate_timeline*.py` | 옛 시계열 그림 (make_figures로 통합됨) |
-| `figures/_legacy/generate_figures.py` | 옛 보고서 그림 (make_figures로 통합됨) |
-| `figures/_legacy/build_treemap_*.py` | 옛 트리맵 데이터 |
+| ~~`figures/_legacy/*`~~ | 2026-07-27 삭제 — `analyze/make_figures.py`로 통합됨. 복구는 `git log --all -- figures/_legacy/` |
 | [analyze/subtopic_bertopic.py](analyze/subtopic_bertopic.py) | BERTopic 소주제 추출 — **언어별 독립 분류**(`--lang ko`, EN/KO cross-lingual 병합 제거), Kiwi 명사 토큰화, cuML GPU. 3단계 분리: ① 클러스터링(`--cluster-method eom --deterministic --no-label`) ② GPT 라벨링(`--label-only`, centroid 50제목+점수) ③ 토픽 그룹화(`--group-topics`, centroid average-linkage sim≥0.80, AI안전 제외). 매핑 → `subtopic_assignments` |
-| [figures/temporal_top10.py](figures/temporal_top10.py) | 분기별 소주제 Top-10 랭킹 변동 — Bump chart(Plotly) + Lifespan Gantt(matplotlib) |
+| ~~`figures/temporal_top10.py`~~ | 2026-07-27 삭제(미유지). 분기별 Top-10 Bump chart + Lifespan Gantt — 복구는 `git log --all -- figures/temporal_top10.py` |
 
 ---
 
@@ -365,9 +363,10 @@ python analyze/subtopic_bertopic.py --group-topics --group-threshold 0.80
 # 기사 제목 리스트(속성>그룹>토픽) 산출물:
 python working/export_ko_lists.py    # → output/article_lists_ko.md
 
-python figures/temporal_top10.py
-# → figures/out/temporal_top10_bump.html (인터랙티브)
-# → figures/out/temporal_top10_lifespan.png
+# (figures/temporal_top10.py 는 2026-07-27 삭제됨 — 아래는 당시 사용법 기록)
+# python figures/temporal_top10.py
+#   → figures/out/temporal_top10_bump.html (인터랙티브)
+#   → figures/out/temporal_top10_lifespan.png
 ```
 
 ### 재실행 (캐시 활용)
@@ -485,7 +484,7 @@ config 상수 (`config.py`):
 - cuml-cu13(RAPIDS) GPU UMAP+HDBSCAN 도입 — KO 36k 클러스터링 5분 → 10초 (~30배)
 - `subtopic_bertopic.py` 리팩터: `--backend {auto,cuml,cpu}` CLI, Kiwi 병렬(`num_workers=8`) + `pretokenize_ko_texts` 정상화 (이전 결과 1,615건 조사 결합형 → 0건), KO `ngram_range=(1,2)`, `'AI'` stopword, 임베딩 캐시(`.cache/bertopic_embeddings/`), lazy OpenAI 클라이언트
 - 신규 테이블 `assembly_analysis.duckdb::subtopic_assignments` — article→topic 매핑 (run_timestamp 버전 구분)
-- 신규 시각화 [figures/temporal_top10.py](figures/temporal_top10.py) — 분기별 Top-10 Bump chart + Lifespan Gantt
+- 신규 시각화 `figures/temporal_top10.py` — 분기별 Top-10 Bump chart + Lifespan Gantt (2026-07-27 삭제)
 - 진단 자료: [BERTOPIC_KIWI_HANDOFF.md](BERTOPIC_KIWI_HANDOFF.md) (Windows hang 진단 기록 — WSL에서 해결됨)
 
 ### 2026-05-28 — 뉴스 DB 분리 + 2단계 cleaning 파이프라인

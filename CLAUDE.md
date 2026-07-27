@@ -168,7 +168,7 @@ No test suite, linter, or CI — this is a research/analysis repo.
 
   Past one-shot migrations (Phase 1~5 backfills, view creation, DB split, retired Naver collectors v1~v3) are not kept on disk. Recover via `git log --all -- collect/` or `collect/_legacy/` if needed.
 - **[figures/](figures/)** — 그림 **산출물** 디렉터리 (`*.png` + `figures_data.xlsx`). 보고서가 `figures/*.png`를 고정 참조한다. 생성기는 더 이상 여기 없고 [analyze/make_figures.py](analyze/make_figures.py)가 정본 (구 `regenerate_all.py`; 데이터 갱신 후 그림이 필요하면 `python analyze/make_figures.py` 재실행).
-  - `figures/_legacy/` — superseded viz scripts (`generate_figures.py`, `generate_timeline*.py`, `build_treemap*.py`, `_viz_attr_law.py`).
+  - 옛 viz 스크립트(`figures/_legacy/`, `figures/temporal_top10.py`)는 2026-07-27 삭제됨 — `analyze/make_figures.py`가 정본. 필요하면 `git log --all -- figures/` 로 복구.
 - **[replicate_carvao/](replicate_carvao/)**, **[kr_analysis/](kr_analysis/)** — frozen reference folders (see below).
 
 ## Two frozen reference folders
