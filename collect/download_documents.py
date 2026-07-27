@@ -486,4 +486,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import db_audit
+    with db_audit.audit_run(__file__, config.RAW_DB_PATH, argv=sys.argv[1:]):
+        main()

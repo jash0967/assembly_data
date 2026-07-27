@@ -13,6 +13,8 @@
   - `news_articles` (Stage 1+2+3 적용본, 76,645)
   - `news_cleaning_runs` (빌드 메타) — **news_cleaning.py가 소유**
   - `news_classifications`, `news_prompt_versions` — **classify_news_kr*.py가 소유** (cleaning은 만들지 않음)
+  - `subtopic_assignments` — **subtopic_bertopic.py가 소유** (append-only, run_timestamp별)
+- 감사 로그 `data/_audit/db_updates.jsonl` — **db_audit.py가 소유**. 위 스크립트들이 자기 실행을 `audit_run()` 으로 감싸 append 한다(테이블 소유권 모델 밖 — DB 파일 안이 아니라 사이드카). `news_cleaning.py` 의 빌드 실패 → `.bak` 복원에도 이력이 살아남게 하려는 것이 위치 선택의 이유.
 
 **워크플로우**:
 ```

@@ -502,26 +502,36 @@ def summarize(results):
 
 
 def purge_caches(targets: list[str]) -> None:
-    """Delete Stage 2 AI filter and 10-attribute classification rows for given targets."""
-    con = duckdb.connect(config.ANALYSIS_DB_PATH)
+    """Delete Stage 2 AI filter and 10-attribute classification rows for given targets.
+
+    Reuses the shared write connection (`_init_db()` runs first in `main()`).
+    Opening a second connection here was pointless — DuckDB hands back the same
+    instance for the same file+config — and the old `finally: if must_close:`
+    referenced a name that was never defined in this function, so `--force`
+    crashed with NameError right after the DELETEs committed.
+    """
+    con = _db_con if _db_con is not None else duckdb.connect(config.ANALYSIS_DB_PATH)
+    must_close = _db_con is None
     try:
         cls_total = 0
         ai_total = 0
         for t in targets:
-            con.execute(
+            # DuckDB의 DELETE 는 삭제 행 수를 결과로 돌려준다.
+            cls_total += con.execute(
                 "DELETE FROM bill_classifications WHERE source = ? AND prompt_version = ?",
                 [t, PROMPT_VERSION],
-            )
-            cls_total += con.execute("SELECT changes()").fetchone()[0] if False else 0
+            ).fetchone()[0]
             if t.startswith("kr_"):
                 age = int(t.split("_")[1])
-                con.execute("DELETE FROM bill_ai_filter WHERE age = ?", [age])
+                ai_total += con.execute(
+                    "DELETE FROM bill_ai_filter WHERE age = ?", [age]
+                ).fetchone()[0]
         con.commit()
     finally:
         if must_close:
             con.close()
-    print(f"--force: deleted DB rows for {len(targets)} target(s) (version={PROMPT_VERSION})",
-          flush=True)
+    print(f"--force: deleted {cls_total:,} classification + {ai_total:,} AI-filter rows "
+          f"for {len(targets)} target(s) (version={PROMPT_VERSION})", flush=True)
 
 
 _SCHEMA_DDL = """
@@ -597,4 +607,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import db_audit
+    with db_audit.audit_run(__file__, config.ANALYSIS_DB_PATH, argv=sys.argv[1:]):
+        main()

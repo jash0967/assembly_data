@@ -862,6 +862,32 @@ vconfsubcconflist (소위원회 회의록)
 | `row_count` | 수집 건수 |
 | `fetched_at` | 수집 시각 |
 
+`_progress`는 task별 **최신 상태만** 유지합니다(`INSERT OR REPLACE`). 실행별 이력은 아래 감사 로그를 보세요.
+
+### DB 변경 이력 — `data/_audit/db_updates.jsonl` (2026-07-27 도입)
+
+4개 DuckDB(`assembly_raw`, `assembly_analysis`, `news`, `news_analysis`)에 대한 **실행별 변경 기록**. DB 안이 아니라 사이드카 JSONL 파일에 쌓입니다(이유는 [db_audit.py](db_audit.py) 모듈 docstring). 한 줄 = 이벤트 1건:
+
+| event | 언제 | 주요 필드 |
+|-------|------|-----------|
+| `run_start` | writer 스크립트 시작 | `run_id`, `db`, `script`, `argv`, `started_at`, `git_sha`, `host`, `pid` |
+| `run_end` | 종료(정상·예외·중단 모두) | `status`(`ok`/`error`/`interrupted`/`exit:N`), `duration_s`, `changed_tables`, `tables[]`, `collect_tasks[]`, `note`, `error` |
+| `external_change` | 계측 밖 변경 탐지 | `detected_at`, `since`, `tables[]` |
+
+`tables[]` 원소: `table`, `change`(`rows_added`/`rows_removed`/`rows_updated`/`schema_changed`/`table_created`/`table_dropped`/`table_rebuilt`), `rows_before`, `rows_after`, `delta`, `touched`(이번 run이 실제로 기록한 행 수), `ts_column`, `rebuilt`(전면 재작성 사유).
+
+`run_start`만 있고 대응하는 `run_end`가 없으면 그 실행은 SIGKILL 등으로 죽은 것입니다.
+
+```sql
+-- 최근 변경 20건 (MCP query 도구에서도 그대로 동작)
+SELECT script, argv, status, changed_tables, tables
+FROM read_json_auto('/home/jays0967/assembly_data/data/_audit/db_updates.jsonl')
+WHERE event = 'run_end' AND changed_tables > 0
+ORDER BY finished_at DESC LIMIT 20;
+```
+
+CLI: `python db_audit.py --log | --runs | --check | --selftest`
+
 ---
 
 ## 13. AI 정책 분석 통합 테이블 (Phase 3~5 도입)

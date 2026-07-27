@@ -516,4 +516,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # DB 변경 이력 기록 — 무엇이 갱신됐는지 data/_audit/db_updates.jsonl 에 남는다.
+    # 감사는 read-only 스냅샷만 찍으므로 이 스크립트의 커넥션·트랜잭션과 무관하다.
+    import db_audit
+    with db_audit.audit_run(__file__, config.RAW_DB_PATH, argv=sys.argv[1:]):
+        main()

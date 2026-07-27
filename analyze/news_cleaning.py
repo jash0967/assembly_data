@@ -494,7 +494,8 @@ WHERE {where}""")
 # ─── main build ───────────────────────────────────────────────────────────────
 
 
-def build() -> None:
+def build() -> str:
+    """빌드 후 이번에 쓰인 cleaning_version 을 돌려준다 (감사 로그 note 용)."""
     _check_raw_not_locked()
 
     sanitized = SANITIZE_CONTENT_SQL("content")
@@ -664,6 +665,7 @@ def build() -> None:
         raise
 
     con.close()
+    return version
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -690,7 +692,16 @@ def main() -> None:
     elif args.dry_run:
         dry_run()
     else:
-        build()
+        # DB를 바꾸는 경로만 감사한다 (--dry-run/--stage1-only 는 read-only).
+        # 감사 로그는 news_analysis.duckdb **밖**(data/_audit/)에 쌓이므로
+        # 실패 시 _restore_from_backup() 이 파일을 되돌려도 이력이 남는다.
+        import db_audit
+        with db_audit.audit_run(__file__, config.NEWS_ANALYSIS_DB_PATH,
+                                argv=sys.argv[1:]) as _run:
+            _run.mark_rebuilt("news_articles",
+                              "Stage 1+2 CTAS 재빌드 (DROP + CREATE TABLE AS)")
+            version = build()
+            _run.note(f"cleaning_version={version}")
 
 
 if __name__ == "__main__":

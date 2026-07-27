@@ -1248,7 +1248,12 @@ def main():
             results[attr] = res
 
     # ── DuckDB: article→topic 매핑 저장 ──
-    write_assignments_to_db(results)
+    # 이 스크립트에서 DB를 바꾸는 유일한 지점 — 여기만 감사한다
+    # (--label-only/--group-topics 는 위에서 조기 return 하는 read-only 경로).
+    import db_audit
+    with db_audit.audit_run(__file__, config.NEWS_ANALYSIS_DB_PATH,
+                            argv=sys.argv[1:]):
+        write_assignments_to_db(results)
 
     # JSON에는 assignments(대량) 빼고 저장. 대표문서는 유지 → --label-only 가 사용.
     for d in results.values():

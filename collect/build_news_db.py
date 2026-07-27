@@ -188,4 +188,13 @@ if __name__ == "__main__":
     ap.add_argument("--rebuild", action="store_true",
                     help="drop news_articles table first")
     args = ap.parse_args()
-    build(rebuild=args.rebuild)
+
+    import config
+    import db_audit
+    with db_audit.audit_run(__file__, config.NEWS_RAW_DB_PATH,
+                            argv=sys.argv[1:]) as _run:
+        if args.rebuild:
+            # DROP + 재적재라 행 수가 같아도 내용은 전량 새로 쓰인다 —
+            # 스냅샷 비교로는 알 수 없으므로 명시적으로 알린다.
+            _run.mark_rebuilt("news_articles", "--rebuild (DROP TABLE 후 재적재)")
+        build(rebuild=args.rebuild)

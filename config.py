@@ -30,6 +30,12 @@ FIGURES_SOURCE_DIR = os.path.join(FIGURES_OUT_DIR, "source")  # 출판사 인계
 WORKING_DIR    = _WORKING_DIR
 STABILITY_DIR  = os.path.join(_WORKING_DIR, "stability")   # BERTopic 안정성 실험 npy/JSON
 
+# DB 업데이트 감사 로그 (data/_audit/) — 재생성 불가한 이력이므로 data/ 에 거주.
+# 대상 DB 밖에 두는 이유는 db_audit.py 모듈 docstring 참조.
+AUDIT_DIR        = os.path.join(_DATA_DIR, "_audit")
+AUDIT_LOG_PATH   = os.path.join(AUDIT_DIR, "db_updates.jsonl")   # append-only 이벤트
+AUDIT_STATE_PATH = os.path.join(AUDIT_DIR, "state.json")         # 마지막 스냅샷 (드리프트 기준선)
+
 # 캐시 (재생성 가능, .gitignore에 등재)
 CACHE_DIR              = _CACHE_DIR
 BERTOPIC_EMBED_CACHE   = os.path.join(_CACHE_DIR, "bertopic_embeddings")

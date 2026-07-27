@@ -233,6 +233,9 @@ Carvão Appendix II 기준 정본:
 ### 5.1 수집
 | 스크립트 | 역할 |
 |----------|------|
+| [collect/download_all.py](collect/download_all.py) | Open API 37종 수집 허브 (13~22대). stale 캐시(`_progress`) 존중, 종료 시 `validate_collection` 자동 호출 |
+| [collect/download_documents.py](collect/download_documents.py) | 회의록·보고서 첨부(PDF/HWP/HWPX) 다운로드 + 본문 추출 → `document_text` |
+| [db_audit.py](db_audit.py) | **DB 변경 이력** — 위 수집·분류 스크립트가 `audit_run()` 으로 자신을 감싸 `data/_audit/db_updates.jsonl` 에 기록. 조회: `--log` / `--runs` / `--check` |
 | [collect/download_bills.py](collect/download_bills.py) | 한국 법안 API 수집 orchestrator |
 | [collect/collector.py](collect/collector.py) | 법안 크롤링 구현 |
 | [collect/collect_guardian.py](collect/collect_guardian.py) | Guardian API 수집 |
@@ -398,10 +401,16 @@ config 상수 (`config.py`):
 
 ### 데이터베이스 (정본, data/)
 - [ ] `data/bills_kr/assembly_raw.duckdb` — 37 API + bill_text + document_text + speeches
-- [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + **`subtopic_assignments`** (BERTopic article→topic 매핑, run_timestamp별) + 분석 뷰
+- [ ] `data/bills_kr/assembly_analysis.duckdb` — bill_classifications + bill_ai_filter + speech_issues + 분석 뷰
+      (`subtopic_assignments` 는 여기가 아니라 `news_analysis.duckdb` 에 있다 — `subtopic_bertopic.py::write_assignments_to_db()` 참조)
 - [ ] `data/bills_us/congress.duckdb` — US 118·119 Congress API 수집물
 - [ ] `data/news/news.duckdb` — raw `news_articles` (157,886)
-- [ ] `data/news/news_analysis.duckdb` — `news_articles` (Stage 1+2 적용본, 76,645) + **`news_classifications`** (+ `cleaning_version` 컬럼) + `news_prompt_versions` + **`news_cleaning_runs`** (빌드 메타 누적)
+- [ ] `data/news/news_analysis.duckdb` — `news_articles` (Stage 1+2 적용본, 76,645) + **`news_classifications`** (+ `cleaning_version` 컬럼) + `news_prompt_versions` + **`news_cleaning_runs`** (빌드 메타 누적) + **`subtopic_assignments`** (BERTopic article→topic 매핑, run_timestamp별)
+
+### DB 변경 이력 (data/_audit/, since 2026-07-27)
+- [ ] `data/_audit/db_updates.jsonl` — 위 4개 DB에 대한 실행별 변경 기록 (append-only). `python db_audit.py --log` / `--runs` / `--check`
+- [ ] `data/_audit/state.json` — 마지막 스냅샷 (계측 밖 변경 탐지 기준선)
+- 기록 주체: [db_audit.py](db_audit.py). writer 스크립트가 `with db_audit.audit_run(__file__, <DB경로>)` 로 자기 실행을 감싼다. 새 writer를 추가하면 같은 3줄을 넣을 것.
 
 ### 원본 수집 (JSON, 일부는 DB로 흡수됨)
 - [ ] `data/news/guardian_articles_raw.json`

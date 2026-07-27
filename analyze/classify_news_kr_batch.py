@@ -295,7 +295,20 @@ def _parse_output(text: str) -> tuple[list[dict], int, int]:
     return rows, ok, err
 
 
-def cmd_collect(_args: argparse.Namespace) -> None:
+def cmd_collect(args: argparse.Namespace) -> None:
+    """DB에 쓰는 유일한 서브커맨드 — 여기만 감사 대상.
+
+    `full` 도 마지막에 이 함수를 부르므로 두 경로가 함께 커버된다. main() 을
+    통째로 감싸지 않는 이유: `full` 은 Batch 폴링으로 24h+ 열려 있고 Ctrl-C
+    재개가 정상 운용이라(모듈 docstring), run 하나가 며칠 열린 채로 남는다.
+    """
+    import db_audit
+    with db_audit.audit_run(__file__, config.NEWS_ANALYSIS_DB_PATH,
+                            argv=sys.argv[1:]):
+        _collect_batches(args)
+
+
+def _collect_batches(_args: argparse.Namespace) -> None:
     state = load_state()
     refreshed_any = False
     for i, b in enumerate(state["batches"], 1):

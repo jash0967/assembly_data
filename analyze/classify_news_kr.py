@@ -290,9 +290,19 @@ def main():
     p.add_argument("--force", action="store_true", help="drop existing rows at this version")
     args = p.parse_args()
 
-    run(workers=args.workers, limit=args.limit, force=args.force)
-    summarize()
+    global _db_con
+    try:
+        run(workers=args.workers, limit=args.limit, force=args.force)
+        summarize()
+    finally:
+        # classify_bills.py·download_*.py 와 같은 관행. 열어둔 채 끝내면
+        # 다음 read-only 접속(감사 로그의 종료 스냅샷 포함)이 막힌다.
+        if _db_con is not None:
+            _db_con.close()
+            _db_con = None
 
 
 if __name__ == "__main__":
-    main()
+    import db_audit
+    with db_audit.audit_run(__file__, config.NEWS_ANALYSIS_DB_PATH, argv=sys.argv[1:]):
+        main()
