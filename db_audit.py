@@ -39,21 +39,72 @@
 ────────────────────────────────────────────────────────────────────────
 변경을 어떻게 판정하는가 — 관측된 사실만
 ────────────────────────────────────────────────────────────────────────
-run 시작·종료에 read-only 스냅샷을 찍어 비교한다:
-  - `COUNT(*)` 차이            → rows_before / rows_after / delta
-  - `duckdb_tables().sql` 해시 변화 → 컬럼 추가·타입 변경 탐지
-  - 행 단위 write 타임스탬프(`extracted_at`, `classified_at`, `ingested_at` …)로
-    `COUNT(*) FILTER (WHERE ts >= run_started_at)` → **이번 run 이 실제로 남긴
-    행 수**. 시도한 문(statement) 수가 아니라 DB에 남은 효과를 세므로
-    `INSERT OR IGNORE` 로 무시된 행·롤백된 행이 자동으로 빠진다.
-  - raw DB는 `_progress` 를 같은 방식으로 조회해 어느 API의 몇 개 task가
-    다시 쓰였는지까지 남긴다 (파이프라인 트랜잭션과 함께 롤백되므로 정확).
-  - 테이블을 통째로 DROP+CREATE 하는 두 곳(news_cleaning 의 CTAS 재빌드,
-    build_news_db --rebuild)은 스스로 `run.mark_rebuilt(table, 사유)` 로 알린다.
-    `duckdb_tables().table_oid` 로 이걸 자동 탐지하려던 초기 설계는 폐기했다 —
-    실측 결과 oid 는 카탈로그 로드 순서로 재부여되는 위치 id 라서 DB를 다시
-    열기만 해도 값이 바뀌고(20625 ↔ 22140), 커넥션이 다른 두 스냅샷 사이에서는
-    "재생성됐다/아니다"를 전혀 판별하지 못한다.
+run 시작·종료에 read-only 스냅샷을 찍어 비교한다. 테이블마다 네 가지를 본다:
+
+  1. `COUNT(*)`                     → rows_before / rows_after / delta
+  2. `duckdb_tables().sql` 해시     → 컬럼 추가·타입 변경 탐지
+  3. **내용 지문** (멀티셋 해시)     → 행 수·스키마가 그대로인 내용 교체 탐지
+  4. **저장 지문** (물리 배치 해시)  → 내용까지 같은 재작성, 그리고 3을 건너뛴
+                                       테이블의 대체 신호
+
+여기에 행 단위 write 타임스탬프(`extracted_at`, `classified_at`, `ingested_at`
+…)로 `COUNT(*) FILTER (WHERE ts >= run_started_at)` → **이번 run 이 실제로
+남긴 행 수**를 더한다. 시도한 문(statement) 수가 아니라 DB에 남은 효과를
+세므로 `INSERT OR IGNORE` 로 무시된 행·롤백된 행이 자동으로 빠진다.
+raw DB는 `_progress` 도 같은 방식으로 조회해 어느 API의 몇 개 task가 다시
+쓰였는지까지 남긴다 (파이프라인 트랜잭션과 함께 롤백되므로 정확).
+
+**내용 지문 (3)** — `bit_xor(hash(cols…))`, `sum(hash(cols…))`, `COUNT(*)` 세
+값의 조합. 행 순서에 무관한 멀티셋 해시라서, 같은 데이터를 순서만 바꿔 다시
+쓰는 것(CTAS ORDER BY, DELETE+동일내용 재INSERT)을 변경으로 오인하지 않는다.
+
+  - XOR **만으로는 안 된다**: 완전히 동일한 두 행이 서로 상쇄되어 XOR=0 이
+    되는 것을 실측했다. 중복행이 있는 테이블에서 짝수 개 증감이 통째로
+    사라진다. SUM(HUGEINT 누산이라 오버플로 없음)을 함께 둬서 막는다.
+  - 컬럼을 **명시적으로 나열**한다. `hash(x) FROM tbl x` 처럼 행 별칭을 쓰면
+    동명의 컬럼이 있을 때 별칭이 가려져 그 컬럼 하나만 해싱된다(실측). 나머지
+    컬럼의 변경을 통째로 놓치는 조용한 오탐지 경로다.
+  - 커밋됐지만 체크포인트가 안 끝난 쓰기(.wal 만 남기고 프로세스가 즉사한
+    경우)도 read-only 재접속 시 WAL 이 재생되므로 그대로 잡힌다(실측).
+  - BLOB·STRUCT·MAP·LIST·DECIMAL(38,10)·UUID·INTERVAL 전부 해시된다. 빈
+    테이블은 XOR/SUM 이 NULL 이라 "0:0:0" 으로 정규화한다.
+  - 지문에는 알고리즘 태그(`fp_algo`, duckdb 버전 포함)를 같이 저장한다.
+    DuckDB 의 `hash()` 는 버전 간 안정성이 보장되지 않으므로, 태그가 다르면
+    "변경됨"이 아니라 **"비교 불가"** 로 처리한다. 업그레이드 직후 전 테이블이
+    변경으로 뜨는 사고를 막는다.
+
+**비용과 그 처리** — assembly_raw(7.4GB, 41테이블) 전량 내용 해시는 10.0초,
+그중 `document_text` 7.6초 + `bill_text` 1.9초가 대부분이고 나머지 39개 합이
+0.6초다. 스냅샷은 run 당 2회이므로 전량 해시는 작은 실행에 20초를 얹는다.
+그래서 **직전 실행에서 측정된 테이블별 소요시간을 state.json 에 남겨 두고,
+`config.AUDIT_CONTENT_HASH_BUDGET_S`(기본 1.0초)를 넘는 테이블은 다음 실행부터
+내용 해시를 건너뛴다.** 처음 보는 테이블은 항상 해시해서 비용을 학습한다.
+한 run 안에서 시작·종료 스냅샷은 **같은 판단 기준(같은 hint 사전)** 을 쓰므로
+"시작만 해시하고 종료는 건너뛰어 비교 불능" 이 되지 않는다.
+건너뛴 테이블은 `content=null, content_skip="cost"` 로 남고, 비교 결과는
+"변경 없음"이 아니라 **`content_unknown`** 이 된다 — 조용한 누락이 없다.
+그리고 이 비싼 두 테이블은 마침 write 타임스탬프(`extracted_at`/`fetched_at`)를
+가지고 있어 5번 신호가, 저장 지문(4)이 각각 독립적으로 덮는다.
+
+크기는 비용 대리지표가 못 된다: `document_text` 는 storage_info 기준 38블록
+(10MB)인데 7.6초가 걸린다(긴 문자열이 out-of-line 저장이라 블록에 안 잡힘).
+그래서 바이트 임계가 아니라 **측정된 시간**으로 게이트한다.
+
+**저장 지문 (4)** — `pragma_storage_info()` 전체(row_group·segment·block_id·
+compression·stats)의 md5. 41테이블 전량 0.08초로 사실상 공짜다. 실측 확인:
+RW로 열었다 아무것도 안 하고 닫아도(체크포인트 발생) 불변, 한 테이블에 쓰면
+그 테이블만 움직이고 무관한 테이블은 흔들리지 않는다, 긴 텍스트 내부만 바꾼
+경우에도 움직인다. 내용까지 동일한 재작성(CTAS 재빌드, DELETE+동일내용
+재INSERT)은 저장 지문만 움직이므로 `rewritten_identical` 로 따로 분류해
+"다시 쓰긴 했으나 데이터는 그대로"를 "손대지 않음"과 구별한다. 이건 실질
+변경이 아니므로 `changed_tables` 에 세지 않고 `--log` 기본 목록도 채우지 않는다.
+
+`duckdb_tables().table_oid` 로 재작성을 탐지하려던 초기 설계는 폐기했다 —
+실측 결과 oid 는 카탈로그 로드 순서로 재부여되는 위치 id 라서 DB를 다시
+열기만 해도 값이 바뀌고(20625 ↔ 22140), 커넥션이 다른 두 스냅샷 사이에서는
+"재생성됐다/아니다"를 전혀 판별하지 못한다. `mark_rebuilt()` 는 이제 탐지에
+필수가 아니고(3·4번이 자동으로 잡는다) **사람이 읽을 사유를 붙이는 용도**로만
+남는다 — 호출하던 곳은 그대로 두면 된다.
 
 writer 함수 자체는 계측하지 않는다 — "몇 번 INSERT를 호출했나"는 위 관측과
 어긋날 수 있고(무시된 upsert, 롤백된 task), 오버헤드도 크다.
@@ -112,6 +163,13 @@ WRITE_TS_COLUMNS = (
 )
 
 _MAX_ERROR_CHARS = 500
+
+# 내용 지문 알고리즘 태그. DuckDB 의 hash() 는 버전 간 안정성이 보장되지 않으므로
+# 버전을 태그에 넣고, 태그가 다른 두 지문은 "다르다"가 아니라 "비교 불가"로 본다.
+FP_ALGO = f"xor+sum+count/duckdb{duckdb.__version__}"
+
+# 빈 테이블은 bit_xor/sum 이 NULL — 고정 문자열로 정규화한다.
+_EMPTY_FP = "0:0:0"
 
 
 # ────────────────────────────────────────────────────────
@@ -238,13 +296,73 @@ def _ro_connection(db_path: str):
                 con.close()
 
 
-def _snapshot(con) -> dict:
-    """{table: {rows, oid, sql_hash, ts_col}} — 현재 DB 상태.
+def _q(ident: str) -> str:
+    """SQL 식별자 인용. 내부 큰따옴표는 중복으로 이스케이프."""
+    return '"' + str(ident).replace('"', '""') + '"'
+
+
+def _lit(text: str) -> str:
+    """SQL 문자열 리터럴 인용 (pragma_storage_info 인자용)."""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def _storage_fp(con, table: str) -> str | None:
+    """물리 배치 지문 — row_group·segment·block_id·compression·stats 전체의 md5.
+
+    전 테이블 합쳐 0.1초 수준이라 항상 찍는다. 논리 내용이 같아도 다시 쓰면
+    움직이므로, 내용 지문이 "같다"고 할 때 '재작성했으나 데이터는 동일'과
+    '손대지 않음'을 가른다. 내용 해시를 비용 때문에 건너뛴 테이블에서는
+    유일한 변경 신호가 된다.
+    """
+    try:
+        row = con.execute(
+            "SELECT md5(string_agg(_si::VARCHAR, '|' ORDER BY _si::VARCHAR)) "
+            f"FROM pragma_storage_info({_lit(table)}) _si"
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — 뷰·임시테이블 등은 storage_info 가 없다
+        return None
+    return row[0] if row and row[0] else None
+
+
+def _content_fp(con, table: str, cols: list[str]) -> tuple[str | None, float | None]:
+    """행 순서에 무관한 멀티셋 내용 지문 → ("xor:sum:count", 소요초).
+
+    컬럼을 명시적으로 나열하는 것이 중요하다. `hash(x) FROM tbl x` 로 행 별칭을
+    쓰면 동명의 컬럼이 있을 때 별칭이 가려져 그 컬럼만 해싱된다(실측).
+    XOR 단독은 동일한 두 행이 상쇄되므로 SUM 을 함께 쓴다.
+    """
+    if not cols:
+        return None, None
+    expr = "hash(" + ", ".join(_q(c) for c in cols) + ")"
+    t0 = time.perf_counter()
+    try:
+        row = con.execute(
+            f"SELECT bit_xor({expr})::VARCHAR, sum({expr})::VARCHAR, COUNT(*) "
+            f"FROM main.{_q(table)}"
+        ).fetchone()
+    except Exception as e:  # noqa: BLE001 — 해시 불가 타입 등은 비교 불가로 남긴다
+        _warn(f"{table} 내용 지문 실패(비교 불가로 기록): {type(e).__name__}: {e}")
+        return None, None
+    elapsed = time.perf_counter() - t0
+    if not row:
+        return None, elapsed
+    x, s, n = row
+    if not n:
+        return _EMPTY_FP, elapsed
+    return f"{x or 0}:{s or 0}:{n}", elapsed
+
+
+def _snapshot(con, cost_hints: dict | None = None) -> dict:
+    """{table: {rows, sql_hash, ts_col, storage, content, fp_algo, …}} — 현재 DB 상태.
 
     `database_name = current_database()` 로 ATTACH 된 카탈로그를,
     `schema_name = 'main'` 으로 FTS 내부 스키마(fts_main_speeches.*)를 배제한다.
     둘 중 하나라도 빠지면 남의 DB 테이블이 이 DB 이력에 섞이거나
     미수식 COUNT(*) 가 CatalogException 을 낸다.
+
+    cost_hints: {table: 직전 측정 소요초}. 예산(config.AUDIT_CONTENT_HASH_BUDGET_S)을
+    넘긴 테이블은 내용 해시를 건너뛴다. 처음 보는 테이블은 항상 해시해 비용을
+    학습한다. 한 run 의 시작·종료 스냅샷에 **같은 사전**을 넘겨야 비교가 성립한다.
     """
     tables = con.execute(
         """
@@ -256,39 +374,84 @@ def _snapshot(con) -> dict:
     ).fetchall()
 
     ts_cols: dict[str, str] = {}
+    all_cols: dict[str, list[str]] = {}
     try:
         rows = con.execute(
             """
-            SELECT table_name, column_name
+            SELECT table_name, column_name, data_type, column_index
             FROM duckdb_columns()
             WHERE database_name = current_database() AND schema_name = 'main'
-              AND data_type LIKE 'TIMESTAMP%'
+            ORDER BY table_name, column_index
             """
         ).fetchall()
         by_table: dict[str, set] = {}
-        for tname, cname in rows:
-            by_table.setdefault(tname, set()).add(cname)
+        for tname, cname, dtype, _idx in rows:
+            all_cols.setdefault(tname, []).append(cname)
+            if str(dtype).upper().startswith("TIMESTAMP"):
+                by_table.setdefault(tname, set()).add(cname)
         for tname, cnames in by_table.items():
             for candidate in WRITE_TS_COLUMNS:
                 if candidate in cnames:
                     ts_cols[tname] = candidate
                     break
-    except Exception as e:  # noqa: BLE001 — 타임스탬프 델타는 부가정보
-        _warn(f"타임스탬프 컬럼 조회 실패(델타 생략): {type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001 — 컬럼 조회 실패 시 지문 없이 진행
+        _warn(f"컬럼 조회 실패(내용 지문·타임스탬프 델타 생략): {type(e).__name__}: {e}")
 
+    budget = _content_budget()
+    hints = cost_hints or {}
     snap: dict[str, dict] = {}
     for tname, sql in tables:
         try:
-            rows_n = con.execute(f'SELECT COUNT(*) FROM main."{tname}"').fetchone()[0]
+            rows_n = con.execute(f"SELECT COUNT(*) FROM main.{_q(tname)}").fetchone()[0]
         except Exception as e:  # noqa: BLE001 — 한 테이블 실패가 전체를 막지 않는다
             _warn(f"{tname} COUNT(*) 실패(건너뜀): {type(e).__name__}: {e}")
             continue
-        snap[tname] = {
+        entry: dict = {
             "rows": int(rows_n),
             "sql_hash": hashlib.md5((sql or "").encode("utf-8")).hexdigest()[:12],
             "ts_col": ts_cols.get(tname),
+            "storage": _storage_fp(con, tname),
         }
+        cols = all_cols.get(tname) or []
+        prev_cost = hints.get(tname)
+        if budget <= 0:
+            entry["content"], entry["content_skip"] = None, "disabled"
+        elif isinstance(prev_cost, (int, float)) and prev_cost > budget:
+            entry["content"] = None
+            entry["content_skip"] = "cost"
+            entry["fp_cost"] = round(float(prev_cost), 3)   # 학습한 비용은 유지
+        elif not cols:
+            entry["content"], entry["content_skip"] = None, "no_columns"
+        else:
+            fp, elapsed = _content_fp(con, tname, cols)
+            if fp is None:
+                entry["content"], entry["content_skip"] = None, "error"
+            else:
+                entry["content"] = fp
+                entry["fp_algo"] = FP_ALGO
+            if elapsed is not None:
+                entry["fp_cost"] = round(elapsed, 3)
+        snap[tname] = entry
     return snap
+
+
+def _content_budget() -> float:
+    """테이블당 내용 해시 예산(초). 설정이 깨져 있으면 기본 1.0."""
+    try:
+        return float(getattr(config, "AUDIT_CONTENT_HASH_BUDGET_S", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _cost_hints(state: dict, db: str) -> dict:
+    """state.json 에 남은 테이블별 측정 소요시간 → 다음 스냅샷의 게이트 입력."""
+    prev = (state or {}).get(db) or {}
+    out = {}
+    for tname, meta in (prev.get("tables") or {}).items():
+        cost = (meta or {}).get("fp_cost")
+        if isinstance(cost, (int, float)):
+            out[tname] = float(cost)
+    return out
 
 
 def _touched_rows(con, table: str, ts_col: str, since: datetime) -> int | None:
@@ -324,8 +487,33 @@ def _progress_summary(con, since: datetime) -> list[dict] | None:
             for a, n, t, r in rows]
 
 
+# 실질 변경이 아닌 분류 — changed_tables 집계와 --log 기본 목록에서 제외한다.
+_SOFT_CHANGES = frozenset({"rewritten_identical"})
+
+
+def _cmp_fp(b: dict, a: dict, key: str) -> str:
+    """지문 두 개 비교 → 'same' | 'differ' | 'unknown'.
+
+    한쪽이라도 없으면(비용으로 건너뜀·해시 실패·구버전 state) 'unknown'.
+    내용 지문은 알고리즘 태그가 다르면 값이 달라도 'unknown' — DuckDB 를
+    올리면 hash() 결과가 바뀔 수 있어 전 테이블 오탐지가 되기 때문이다.
+    """
+    bv, av = b.get(key), a.get(key)
+    if bv is None or av is None:
+        return "unknown"
+    if key == "content" and b.get("fp_algo") != a.get("fp_algo"):
+        return "unknown"
+    return "same" if bv == av else "differ"
+
+
 def _diff(before: dict | None, after: dict | None) -> list[dict]:
-    """스냅샷 두 장 비교 → 변경된 테이블만."""
+    """스냅샷 두 장 비교 → 변경된 테이블만.
+
+    행 수·스키마가 그대로여도 내용 지문이 다르면 `content_changed`,
+    내용은 같은데 물리 배치만 다르면 `rewritten_identical`,
+    내용 비교가 불가능한데 물리 배치가 움직였으면 `content_unknown` 이다.
+    마지막 것이 핵심 — "모르는 것"을 "변경 없음"으로 접지 않는다.
+    """
     if before is None or after is None:
         return []
     changes = []
@@ -343,17 +531,40 @@ def _diff(before: dict | None, after: dict | None) -> list[dict]:
             continue
         delta = a["rows"] - b["rows"]
         schema_changed = b.get("sql_hash") != a.get("sql_hash")
-        if delta == 0 and not schema_changed:
+        content = _cmp_fp(b, a, "content")
+        storage = _cmp_fp(b, a, "storage")
+
+        if delta > 0:
+            change = "rows_added"
+        elif delta < 0:
+            change = "rows_removed"
+        elif schema_changed:
+            change = "schema_changed"
+        elif content == "differ":
+            change = "content_changed"
+        elif content == "same":
+            # 내용이 확실히 같다 — 물리적으로 다시 썼는지만 남는다.
+            change = "rewritten_identical" if storage == "differ" else None
+        else:  # content == "unknown"
+            change = "content_unknown" if storage == "differ" else None
+
+        if change is None:
             continue  # 변화 없음 — 타임스탬프 델타·mark_rebuilt 는 호출자가 채운다
-        change = ("schema_changed" if schema_changed and delta == 0
-                  else "rows_added" if delta > 0
-                  else "rows_removed")
         entry = {"table": tname, "change": change,
                  "rows_before": b["rows"], "rows_after": a["rows"], "delta": delta}
         if schema_changed:
             entry["schema_changed"] = True
+        if content != "same":
+            entry["content_cmp"] = content
+        if a.get("content_skip"):
+            entry["content_skip"] = a["content_skip"]
         changes.append(entry)
     return changes
+
+
+def _substantive(changes: list[dict]) -> list[dict]:
+    """실질 변경만 (물리 재작성뿐인 항목 제외)."""
+    return [c for c in changes if c.get("change") not in _SOFT_CHANGES]
 
 
 # ────────────────────────────────────────────────────────
@@ -376,6 +587,9 @@ class AuditRun:
         self.after: dict | None = None
         self.changes: list[dict] = []
         self.rebuilt: dict[str, str] = {}
+        # 시작·종료 스냅샷이 같은 게이트 판단을 하도록 run 시작 시점에 한 번만
+        # 읽어 고정한다. 중간에 갱신하면 "시작만 해시하고 종료는 건너뜀"이 된다.
+        self._hints: dict = {}
 
     # -- 사용자 API ------------------------------------------------
     def note(self, text: str) -> None:
@@ -386,10 +600,11 @@ class AuditRun:
     def mark_rebuilt(self, table: str, reason: str = "") -> None:
         """테이블을 통째로 다시 만들었다고 알린다 (DROP+CREATE / CREATE OR REPLACE).
 
-        행 수가 그대로여도 내용이 전부 갈렸다는 사실은 스냅샷 비교로는 알 수
-        없다(table_oid 는 위치 id 라 판별 불가 — 모듈 docstring 참조). 그런
-        재작성을 하는 곳은 두 군데뿐이고 둘 다 자기가 무슨 짓을 했는지 알므로
-        직접 선언하게 한다: news_cleaning 의 CTAS, build_news_db --rebuild.
+        **탐지에는 더 이상 필요하지 않다.** 내용 지문·저장 지문이 행 수가 같은
+        재작성을 자동으로 잡는다(모듈 docstring 참조). 이 호출은 사람이 읽을
+        사유("CTAS 재빌드" 같은)를 로그에 붙이고, 내용까지 동일해 기본 목록에서
+        빠질 재작성을 실질 변경으로 승격시키는 용도로 남는다.
+        기존 호출부(news_cleaning 의 CTAS, build_news_db --rebuild)는 그대로 둔다.
         """
         if table:
             self.rebuilt[str(table)] = reason or "rebuilt"
@@ -408,11 +623,12 @@ class AuditRun:
             "host": socket.gethostname(),
             "pid": os.getpid(),
         })
+        self._hints = _cost_hints(_load_state(), self.db)
         with _ro_connection(self.db_path) as con:
             if con is None:
                 return
             try:
-                self.before = _snapshot(con)
+                self.before = _snapshot(con, self._hints)
             except Exception as e:  # noqa: BLE001
                 _warn(f"시작 스냅샷 실패(무시): {type(e).__name__}: {e}")
                 return
@@ -426,7 +642,7 @@ class AuditRun:
         prev = state.get(self.db)
         if not prev or not prev.get("tables"):
             return
-        drift = _diff(prev["tables"], self.before)
+        drift = _substantive(_diff(prev["tables"], self.before))
         if not drift:
             return
         _append_event({
@@ -445,7 +661,7 @@ class AuditRun:
         with _ro_connection(self.db_path) as con:
             if con is not None:
                 try:
-                    self.after = _snapshot(con)
+                    self.after = _snapshot(con, self._hints)
                     self.changes = _diff(self.before, self.after)
                     changed = {c["table"] for c in self.changes}
                     # 이번 run 이 실제로 남긴 행 수 — 행 수가 그대로인 갱신도 잡는다.
@@ -463,10 +679,14 @@ class AuditRun:
                                      "rows_before": before_rows,
                                      "rows_after": meta["rows"], "delta": 0}
                             self.changes.append(entry)
+                        elif entry.get("change") in _SOFT_CHANGES:
+                            # 물리 재작성뿐인 줄 알았는데 이번 run 이 남긴 행이 있다
+                            # → 실질 변경으로 승격 (기본 목록에서 빠지면 안 된다).
+                            entry["change"] = "rows_updated"
                         entry["touched"] = touched
                         entry["ts_column"] = ts_col
                         changed.add(tname)
-                    # 스크립트가 스스로 선언한 전면 재작성 (행 수가 같아도 기록)
+                    # 스크립트가 스스로 붙인 재작성 사유 (탐지는 지문이 이미 했다)
                     for tname, reason in self.rebuilt.items():
                         entry = next((c for c in self.changes if c["table"] == tname), None)
                         if entry is None:
@@ -479,6 +699,8 @@ class AuditRun:
                                               if isinstance(after_rows, int)
                                               and isinstance(before_rows, int) else 0}
                             self.changes.append(entry)
+                        elif entry.get("change") in _SOFT_CHANGES:
+                            entry["change"] = "table_rebuilt"   # 선언이 있으면 실질 변경
                         entry["rebuilt"] = reason
                     self.changes.sort(key=lambda c: (-abs(c.get("delta") or 0), c["table"]))
                     progress = _progress_summary(con, self.started_at)
@@ -496,9 +718,20 @@ class AuditRun:
             "finished_at": _iso(finished_at),
             "duration_s": round((finished_at - self.started_at).total_seconds(), 1),
             "git_sha": git_sha(),
-            "changed_tables": len(self.changes),
+            # 실질 변경만 센다 — 내용까지 동일한 물리 재작성은 rewritten_tables 로.
+            "changed_tables": len(_substantive(self.changes)),
             "tables": self.changes,
         }
+        rewritten = [c["table"] for c in self.changes
+                     if c.get("change") in _SOFT_CHANGES]
+        if rewritten:
+            event["rewritten_tables"] = rewritten
+        skipped = sorted(t for t, m in (self.after or {}).items()
+                         if m.get("content_skip") == "cost")
+        if skipped:
+            # 무엇을 안 봤는지 반드시 남긴다 — 조용한 축소 금지.
+            event["content_hash_skipped"] = skipped
+            event["content_hash_budget_s"] = _content_budget()
         if self.before is None or self.after is None:
             event["snapshot"] = "unavailable"   # DB가 잠겨 있었음 → 변경 내역 불명
         if progress:
@@ -600,12 +833,13 @@ def check(db: str | None = None, record: bool = True) -> list[dict]:
             if con is None:
                 continue
             try:
-                current = _snapshot(con)
+                current = _snapshot(con, _cost_hints(state, key))
             except Exception as e:  # noqa: BLE001
                 _warn(f"{key} 스냅샷 실패: {type(e).__name__}: {e}")
                 continue
         prev = state.get(key)
-        drift = _diff(prev["tables"], current) if prev and prev.get("tables") else []
+        # 내용까지 동일한 물리 재작성은 데이터 변경이 아니므로 드리프트로 안 센다.
+        drift = _substantive(_diff(prev["tables"], current)) if prev and prev.get("tables") else []
         if drift:
             out.append({"db": key, "since": prev.get("taken_at"), "tables": drift})
             if record:
@@ -632,18 +866,31 @@ def _fmt_table_line(t: dict) -> str:
     b = f"{before:,}" if isinstance(before, int) else "-"
     a = f"{after:,}" if isinstance(after, int) else "-"
     delta = t.get("delta") or 0
+    change = t.get("change")
     bits = [f"{t['table']:<28} {b:>12} → {a:<12}"]
     if delta:
         bits.append(f"({delta:+,})")
+    if change == "content_changed" and not t.get("touched"):
+        # 타임스탬프 델타가 이미 "이번 run 이 N행 남겼다"고 말해 주는 경우엔
+        # 표시하지 않는다. 지문이 **유일한** 근거일 때만 눈에 띄게 남긴다.
+        bits.append("★ 내용 변경 (행 수 동일)")
+    elif change == "content_unknown":
+        why = {"cost": "비용 초과로 내용 해시 생략",
+               "disabled": "내용 해시 비활성",
+               "error": "내용 해시 실패",
+               "no_columns": "컬럼 없음"}.get(t.get("content_skip"), "내용 비교 불가")
+        bits.append(f"? 물리 재작성 감지 — 내용 확인 불가 ({why})")
+    elif change == "rewritten_identical":
+        bits.append("· 재작성됐으나 내용 동일")
     if t.get("touched"):
         bits.append(f"이번 run 기록 {t['touched']:,}행 ({t.get('ts_column')})")
     if t.get("rebuilt"):
         bits.append(f"[전면 재작성: {t['rebuilt']}]")
     if t.get("schema_changed"):
         bits.append("[스키마 변경]")
-    if t.get("change") == "table_created":
+    if change == "table_created":
         bits.append("[신규]")
-    elif t.get("change") == "table_dropped":
+    elif change == "table_dropped":
         bits.append("[삭제됨]")
     return "  " + " ".join(bits)
 
@@ -677,6 +924,10 @@ def cmd_log(args) -> None:
                   "프로세스 종료 후 `db_audit.py --check` 로 확인 가능)")
         for t in e.get("tables", []):
             print(_fmt_table_line(t))
+        if e.get("content_hash_skipped"):
+            print(f"  (내용 해시 생략 — 테이블당 {e.get('content_hash_budget_s')}초 예산 초과: "
+                  + ", ".join(e["content_hash_skipped"])
+                  + ". 저장 지문·타임스탬프 델타로만 관측)")
         for task in (e.get("collect_tasks") or [])[:10]:
             print(f"    수집 task {task['api_id']} ({task['name_kr']}): "
                   f"{task['tasks']:,}건 재수집, {task['rows']:,}행")
@@ -703,6 +954,9 @@ def cmd_runs(args) -> None:
             dur = f"{end.get('duration_s', 0)}s"
             changed = end.get("changed_tables", 0)
             changed_s = f"{changed} 테이블" if changed else "-"
+            n_rw = len(end.get("rewritten_tables") or [])
+            if n_rw:
+                changed_s += f" (+재작성 {n_rw})" if changed else f"재작성만 {n_rw}"
             if end.get("snapshot") == "unavailable":
                 changed_s = "불명(잠김)"
         else:
@@ -916,6 +1170,120 @@ def selftest() -> int:  # noqa: C901 — 검증 항목 나열이라 분기가 �
         t = tables_of(last("run_end")).get("t", {})
         check_that("재작성 기록 (delta=0 인데도)",
                    t.get("rebuilt") == "CTAS 재빌드" and t.get("delta") == 0, str(t))
+
+        print("⑧-b 선언 없는 전면 재작성 — 내용 지문이 자동으로 잡는다")
+        c = duckdb.connect(db)
+        c.execute("CREATE OR REPLACE TABLE big AS "
+                  "SELECT i AS id, ('v' || i) AS txt FROM range(3000) s(i)")
+        c.close()
+        with audit_run("analyze/fake.py", db):     # 기준선 확보용 no-op run
+            pass
+        with audit_run("analyze/fake.py", db):     # mark_rebuilt 없음
+            c = duckdb.connect(db)
+            c.execute("CREATE OR REPLACE TABLE big AS "
+                      "SELECT i AS id, ('CHANGED' || i) AS txt FROM range(3000) s(i)")
+            c.close()
+        ev = last("run_end")
+        t = tables_of(ev).get("big", {})
+        check_that("mark_rebuilt 없이 content_changed 탐지",
+                   t.get("change") == "content_changed" and t.get("delta") == 0, str(t))
+        check_that("실질 변경으로 집계", ev.get("changed_tables", 0) >= 1, str(ev.get("changed_tables")))
+
+        print("⑧-c 행 순서만 바꾼 재작성 — 오탐지하면 안 된다")
+        with audit_run("analyze/fake.py", db):
+            c = duckdb.connect(db)
+            c.execute("CREATE OR REPLACE TABLE big AS SELECT * FROM big ORDER BY id DESC")
+            c.close()
+        ev = last("run_end")
+        t = tables_of(ev).get("big", {})
+        check_that("순서만 바뀌면 content_changed 아님",
+                   t.get("change") != "content_changed", str(t))
+        check_that("재작성 사실은 남음 (rewritten_identical)",
+                   t.get("change") == "rewritten_identical", str(t))
+        check_that("실질 변경으로는 안 셈", ev.get("changed_tables") == 0,
+                   str(ev.get("changed_tables")))
+
+        print("⑧-d DELETE + 동일내용 재INSERT (download_all.save_rows 패턴)")
+        with audit_run("collect/fake.py", db):
+            c = duckdb.connect(db)
+            c.execute("CREATE OR REPLACE TABLE _bak AS SELECT * FROM big")
+            c.execute("DELETE FROM big")
+            c.execute("INSERT INTO big SELECT * FROM _bak")
+            c.execute("DROP TABLE _bak")
+            c.close()
+        t = tables_of(last("run_end")).get("big", {})
+        check_that("동일내용 재삽입은 content_changed 아님",
+                   t.get("change") != "content_changed", str(t))
+
+        print("⑧-e DELETE + 다른내용 재INSERT (실제로 놓쳤던 케이스)")
+        with audit_run("collect/fake.py", db):
+            c = duckdb.connect(db)
+            c.execute("CREATE OR REPLACE TABLE _bak AS SELECT id, 'NEW' AS txt FROM big")
+            c.execute("DELETE FROM big")
+            c.execute("INSERT INTO big SELECT * FROM _bak")
+            c.execute("DROP TABLE _bak")
+            c.close()
+        t = tables_of(last("run_end")).get("big", {})
+        check_that("행 수 동일 + 내용 교체 → content_changed",
+                   t.get("change") == "content_changed" and t.get("delta") == 0, str(t))
+
+        print("⑧-f 중복행 상쇄 — XOR 단독이면 놓치는 경우")
+        c = duckdb.connect(db)
+        c.execute("CREATE OR REPLACE TABLE dup AS SELECT 1 AS a UNION ALL SELECT 1")
+        c.close()
+        with audit_run("analyze/fake.py", db):
+            pass                                   # 기준선
+        with audit_run("analyze/fake.py", db):
+            c = duckdb.connect(db)
+            c.execute("CREATE OR REPLACE TABLE dup AS SELECT 2 AS a UNION ALL SELECT 2")
+            c.close()
+        t = tables_of(last("run_end")).get("dup", {})
+        check_that("중복 2행 → 다른 중복 2행 탐지 (SUM 항이 있어야 통과)",
+                   t.get("change") == "content_changed", str(t))
+
+        print("⑧-g 다중 컬럼 — 첫 컬럼 외의 변경도 잡는가 (별칭 가림 회귀)")
+        c = duckdb.connect(db)
+        c.execute("CREATE OR REPLACE TABLE multi AS "
+                  "SELECT i AS x, i AS y, i AS z FROM range(500) s(i)")
+        c.close()
+        with audit_run("analyze/fake.py", db):
+            pass
+        with audit_run("analyze/fake.py", db):
+            c = duckdb.connect(db)
+            c.execute("UPDATE multi SET z = z + 1")   # 첫 컬럼 x 는 그대로
+            c.close()
+        t = tables_of(last("run_end")).get("multi", {})
+        check_that("마지막 컬럼만 바뀌어도 탐지", t.get("change") == "content_changed", str(t))
+
+        print("⑧-h 내용 해시 생략 시 — '변경 없음'이 아니라 '확인 불가'")
+        saved_budget = config.AUDIT_CONTENT_HASH_BUDGET_S
+        try:
+            with audit_run("analyze/fake.py", db):
+                pass                                # 기준선 (예산 정상)
+            # 직전 측정 비용을 넘도록 예산을 극단적으로 낮춘다
+            config.AUDIT_CONTENT_HASH_BUDGET_S = 1e-9
+            with audit_run("analyze/fake.py", db):
+                c = duckdb.connect(db)
+                c.execute("UPDATE multi SET z = z + 100")
+                c.close()
+            ev = last("run_end")
+            t = tables_of(ev).get("multi", {})
+            check_that("생략된 테이블은 content_unknown",
+                       t.get("change") == "content_unknown", str(t))
+            check_that("생략 사실이 로그에 남음",
+                       "multi" in (ev.get("content_hash_skipped") or []),
+                       str(ev.get("content_hash_skipped")))
+        finally:
+            config.AUDIT_CONTENT_HASH_BUDGET_S = saved_budget
+
+        print("⑧-i 지문 알고리즘 태그가 다르면 '변경'이 아니라 '비교 불가'")
+        fake_b = {"rows": 1, "sql_hash": "x", "storage": "s1",
+                  "content": "1:1:1", "fp_algo": "old"}
+        fake_a = {"rows": 1, "sql_hash": "x", "storage": "s2",
+                  "content": "9:9:9", "fp_algo": "new"}
+        d = _diff({"z": fake_b}, {"z": fake_a})
+        check_that("태그 불일치 → content_unknown",
+                   d and d[0]["change"] == "content_unknown", str(d))
 
         print("⑨ 행 수 불변 갱신(UPDATE) — 타임스탬프 델타로 포착")
         with audit_run("analyze/fake.py", db):

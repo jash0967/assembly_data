@@ -146,7 +146,16 @@ if __name__ == "__main__":
 - **감사는 대상 DB에 write 커넥션을 열지 않고, 파이프라인 커넥션도 쓰지 않는다.** 파이프라인 커넥션을 빌려 쓰면 DuckDB에서 제3자의 `commit()`이 남의 미완 트랜잭션을 확정시켜(`save_rows()`가 DELETE 직후 Ctrl-C로 멈춘 상황) 데이터가 유실된다. RW를 먼저 열면 같은 프로세스의 read-only 접속이 전부 죽는다.
 - **로그는 대상 DB 밖(JSONL)에 쓴다.** `news_cleaning.py`는 실패 시 `.bak`을 DB 파일 위에 덮어쓰므로, 감사 테이블이 그 안에 있으면 이력이 되감기고 열린 커넥션이 복원본을 손상시킬 수 있다.
 
-변경 판정은 관측된 사실만 쓴다 — run 전후 read-only 스냅샷의 `COUNT(*)`·`duckdb_tables().sql` 해시 차이, 그리고 행 단위 write 타임스탬프(`extracted_at`/`classified_at`/`ingested_at` 등)로 센 "이번 run이 실제로 남긴 행 수"(행 수가 그대로인 UPDATE·upsert를 여기서 잡는다). writer 함수는 계측하지 않는다(무시된 `INSERT OR IGNORE`·롤백된 task를 실제보다 부풀린다). 행 수·스키마가 모두 그대로인 전면 재작성(`news_cleaning`의 CTAS, `build_news_db --rebuild`)만 스크립트가 `run.mark_rebuilt(table, 사유)`로 직접 선언한다.
+변경 판정은 관측된 사실만 쓴다. run 전후 read-only 스냅샷에서 테이블마다 네 가지를 본다 — `COUNT(*)`, `duckdb_tables().sql` 해시, **내용 지문**(행 순서에 무관한 멀티셋 해시 `bit_xor+sum+count`), **저장 지문**(`pragma_storage_info` md5). 여기에 행 단위 write 타임스탬프(`extracted_at`/`classified_at`/`ingested_at` 등)로 센 "이번 run이 실제로 남긴 행 수"를 더한다. writer 함수는 계측하지 않는다(무시된 `INSERT OR IGNORE`·롤백된 task를 실제보다 부풀린다).
+
+**행 수·스키마가 그대로인 전면 재작성은 2026-08-02부터 자동으로 잡힌다** (`content_changed`). 그 전에는 `mark_rebuilt()` 선언이 있는 두 곳(`news_cleaning`의 CTAS, `build_news_db --rebuild`)만 기록됐고, `download_all`의 DELETE+재INSERT로 내용만 갈린 경우(예: `nxrvzonlafugpqjuh` 위원회 현황 358행 그대로 3건 변동)는 통째로 누락됐다. `mark_rebuilt()`는 이제 탐지에 필수가 아니라 **사람이 읽을 사유를 붙이는 용도**이므로 기존 호출부는 그대로 두면 된다.
+
+설계상 지켜야 할 것 두 가지가 더 있다 (근거는 전부 실측, `db_audit.py` docstring):
+
+- **내용 지문은 XOR 단독으로 만들지 않는다.** 완전히 동일한 두 행이 상쇄돼 XOR=0이 되므로 중복행 테이블에서 짝수 개 증감이 사라진다. SUM을 함께 둔다.
+- **해시할 컬럼을 명시적으로 나열한다.** `hash(x) FROM tbl x`처럼 행 별칭을 쓰면 동명 컬럼이 있을 때 별칭이 가려져 **그 컬럼 하나만** 해싱된다 — 나머지 컬럼의 변경을 통째로 놓치는 조용한 오탐지 경로다.
+
+비용은 테이블당 시간 예산(`config.AUDIT_CONTENT_HASH_BUDGET_S`, 기본 1.0초)으로 막는다. 직전 실행에서 측정된 소요시간을 `state.json`에 남겨 두고 예산 초과 테이블은 다음 실행부터 내용 해시를 건너뛴다. raw DB 전량 해시는 10초(`document_text` 8.3s + `bill_text` 2.0s가 대부분, 나머지 39개 합 0.6초)라서 게이트 적용 시 run당 오버헤드가 ~0.6초로 떨어진다. 건너뛴 테이블은 "변경 없음"이 아니라 **`content_unknown`**으로 남고 `content_hash_skipped[]`에 목록이 기록된다 — 조용한 축소가 없다. 그 두 테이블은 write 타임스탬프와 저장 지문이 각각 독립적으로 덮는다.
 
 ```bash
 python db_audit.py --log            # 변경이 있었던 실행만 (기본)

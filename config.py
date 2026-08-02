@@ -36,6 +36,12 @@ AUDIT_DIR        = os.path.join(_DATA_DIR, "_audit")
 AUDIT_LOG_PATH   = os.path.join(AUDIT_DIR, "db_updates.jsonl")   # append-only 이벤트
 AUDIT_STATE_PATH = os.path.join(AUDIT_DIR, "state.json")         # 마지막 스냅샷 (드리프트 기준선)
 
+# 테이블 내용 지문(멀티셋 해시)에 테이블당 허용할 시간. 직전 실행에서 이보다
+# 오래 걸린 테이블은 다음 실행부터 내용 해시를 건너뛰고 저장 지문·타임스탬프
+# 델타로만 본다 (건너뛴 사실은 로그에 남는다). 0 이면 내용 지문 전면 비활성,
+# 아주 크게 주면 항상 전량 해시. 실측 근거는 db_audit.py 모듈 docstring.
+AUDIT_CONTENT_HASH_BUDGET_S = float(os.environ.get("AUDIT_CONTENT_HASH_BUDGET_S", "1.0"))
+
 # 캐시 (재생성 가능, .gitignore에 등재)
 CACHE_DIR              = _CACHE_DIR
 BERTOPIC_EMBED_CACHE   = os.path.join(_CACHE_DIR, "bertopic_embeddings")

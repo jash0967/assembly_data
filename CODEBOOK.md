@@ -871,10 +871,25 @@ vconfsubcconflist (소위원회 회의록)
 | event | 언제 | 주요 필드 |
 |-------|------|-----------|
 | `run_start` | writer 스크립트 시작 | `run_id`, `db`, `script`, `argv`, `started_at`, `git_sha`, `host`, `pid` |
-| `run_end` | 종료(정상·예외·중단 모두) | `status`(`ok`/`error`/`interrupted`/`exit:N`), `duration_s`, `changed_tables`, `tables[]`, `collect_tasks[]`, `note`, `error` |
+| `run_end` | 종료(정상·예외·중단 모두) | `status`(`ok`/`error`/`interrupted`/`exit:N`), `duration_s`, `changed_tables`, `tables[]`, `rewritten_tables[]`, `content_hash_skipped[]`, `collect_tasks[]`, `note`, `error` |
 | `external_change` | 계측 밖 변경 탐지 | `detected_at`, `since`, `tables[]` |
 
-`tables[]` 원소: `table`, `change`(`rows_added`/`rows_removed`/`rows_updated`/`schema_changed`/`table_created`/`table_dropped`/`table_rebuilt`), `rows_before`, `rows_after`, `delta`, `touched`(이번 run이 실제로 기록한 행 수), `ts_column`, `rebuilt`(전면 재작성 사유).
+`tables[]` 원소: `table`, `change`, `rows_before`, `rows_after`, `delta`, `touched`(이번 run이 실제로 기록한 행 수), `ts_column`, `rebuilt`(재작성 사유), `content_cmp`, `content_skip`.
+
+`change` 값:
+
+| change | 뜻 |
+|--------|-----|
+| `rows_added` / `rows_removed` | 행 수가 늘거나 줄었다 |
+| `rows_updated` | 행 수는 그대로인데 이번 run 이 남긴 write 타임스탬프가 있다 |
+| `content_changed` | **행 수·스키마가 그대로인데 내용 지문이 달라졌다** (2026-08-02 도입) |
+| `content_unknown` | 물리적으로 다시 쓰긴 했는데 내용 비교가 불가능했다 (비용 초과로 해시 생략·해시 실패·DuckDB 버전 변경). "변경 없음"이 아니라 "모른다" |
+| `rewritten_identical` | 다시 썼으나 내용은 완전히 동일 (재수집했는데 데이터가 안 바뀐 경우). 실질 변경이 아니라 `changed_tables` 에 세지 않고 `rewritten_tables[]` 로 뺀다 |
+| `schema_changed` | 컬럼 추가·타입 변경 |
+| `table_created` / `table_dropped` | 테이블 생성·삭제 |
+| `table_rebuilt` | 스크립트가 `mark_rebuilt()` 로 사유를 붙인 전면 재작성 |
+
+`content_hash_skipped[]` 는 비용 예산(`config.AUDIT_CONTENT_HASH_BUDGET_S`, 기본 1.0초/테이블)을 넘겨 내용 해시를 생략한 테이블 목록입니다. 현재 raw DB에서는 `document_text`(8.3초)·`bill_text`(2.0초) 둘뿐이고, 이 둘은 write 타임스탬프와 저장 지문이 따로 덮습니다. 판정 원리는 [db_audit.py](db_audit.py) 모듈 docstring 참조.
 
 `run_start`만 있고 대응하는 `run_end`가 없으면 그 실행은 SIGKILL 등으로 죽은 것입니다.
 
